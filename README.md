@@ -2,7 +2,17 @@
 
 A pipeline to build a multi-resolution flood dataset from Copernicus EMSR rapid mapping activations and EO data from GEE. Covers the full workflow from raw CEMS product download and DCC conversion to GEE export submission, Drive retrieval, and final dataset validation. Each processed activation produces 7 analysis-ready GeoTIFFs at mixed resolutions (10 m to 9 km), aligned to a common grid.
 
-**Per-activation GeoTIFF exports:** `S1_VV_VH.tif` (2-band Sentinel-1 SAR, 10 m), `land_cover.tif` (NDVI + NDBI from Sentinel-2, 10 m), `MERIT.tif` (elevation / flow direction / UDA / HAND, 90 m), `Soil.tif` (clay + sand fraction from SoilGrids, 250 m), `ESA_PW.tif` (permanent water mask, 10 m), `Precipitation.tif` (10-day ERA5-Land daily stack, 9 km), `SoilMoisture.tif` (10-day SMAP daily stack, 9 km)
+**Per-activation GeoTIFF exports (7 files per event):**
+
+| File | Bands | Source | GEE Collection |
+|---|---|---|---|
+| `S1_VV_VH.tif` | 2 (VV, VH) | Sentinel-1 SAR GRD, 10 m | `COPERNICUS/S1_GRD` |
+| `land_cover.tif` | 2 (NDVI, NDBI) | Sentinel-2 SR, 10 m | `COPERNICUS/S2_SR_HARMONIZED` |
+| `MERIT.tif` | 4 (elevation, flow dir, UDA, HAND) | MERIT Hydro, 90 m | `MERIT/Hydro/v1_0_1` |
+| `Soil.tif` | 2 (clay, sand) | OpenLandMap SoilGrids, 250 m | `OpenLandMap/SOL/...` |
+| `ESA_PW.tif` | 1 (permanent water mask) | ESA WorldCover, 10 m | `ESA/WorldCover/v200` |
+| `Precipitation.tif` | 10 (daily, 10 days pre-event) | ERA5-Land daily, 9 km | `ECMWF/ERA5_LAND/DAILY_AGGR` |
+| `SoilMoisture.tif` | 10 (daily, 10 days pre-event) | SMAP 10 km, 10 km | `NASA_USDA/HSL/SMAP10KM_soil_moisture` |
 
 ---
 
