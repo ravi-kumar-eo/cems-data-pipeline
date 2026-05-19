@@ -66,10 +66,11 @@ data/
       ESA_PW.tif              1 band   permanent water mask
       Precipitation.tif      10 bands  ERA5-Land daily (10 days pre-event)
       SoilMoisture.tif       10 bands  SMAP daily (10 days pre-event)
-  activations.csv             first-draft catalog from Script 1
-  flood_dataset.csv           final dataset catalog from Script 4
 metadata/
-  flood_dataset.csv           archival copy of the final catalog
+  activations.csv             activation catalog (Script 1)
+  activations_status.csv      per-product download + DCC status (Script 1)
+  gee_tasks_record.csv        GEE task tracking (Script 2)
+  flood_dataset.csv           final dataset catalog (Script 4)
 ```
 
 ---
