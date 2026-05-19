@@ -1,0 +1,16 @@
+data/
+__pycache__/
+*.pyc
+*.pyo
+.DS_Store
+logs/
+*.log
+credentials.json
+metadata/flood_dataset.csv
+*.tif
+*.zip
+*.shp
+*.dbf
+*.shx
+*.prj
+*.cpg
