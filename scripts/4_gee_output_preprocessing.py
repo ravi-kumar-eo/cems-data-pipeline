@@ -1,16 +1,19 @@
 #!/usr/bin/env python3
 """
-Script 4: Validate GEE Exports and Build flood_dataset.csv
+Script 4: GEE Output Preprocessing
 
-Scans all GEE export folders and validates that each activation has all required
-layers with correct band counts. Merges sensor info from activations.csv (Script 1
-output) and adds resolution metadata. Produces the final shareable dataset CSV.
+For each completed GEE export activation:
+  1. Rasterizes the CEMS flood extent shapefile (DCC flood_extent/event.shp)
+     to flood_mask.tif aligned to the S1_VV_VH.tif grid (same CRS, resolution, extent).
+  2. Validates all required layers (band counts, file integrity).
+  3. Assigns HydroBASINS level-12 basin ID and region from AOI centroid.
+  4. Merges sensor metadata from activations.csv and writes dataset_metadata.csv.
 
 Output files:
-  data/flood_dataset.csv           — complete activations with full metadata
-  metadata/flood_dataset.csv       — copy for archival
+  data/GEE_exports/{folder}/flood_mask.tif   binary flood mask per activation (1=flooded)
+  metadata/dataset_metadata.csv              final dataset catalog
 
-Required layers per activation:
+Required layers per activation (post-run):
   S1_VV_VH.tif        2 bands
   land_cover.tif      2 bands
   MERIT.tif           4 bands
@@ -18,9 +21,10 @@ Required layers per activation:
   ESA_PW.tif          1 band
   Precipitation.tif  10 bands
   SoilMoisture.tif   10 bands
+  flood_mask.tif       1 band
 
 Usage:
-  python scripts/4_validate_exports.py
+  python scripts/4_gee_output_preprocessing.py
 """
 
 import csv
@@ -30,8 +34,11 @@ from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
+import numpy as np
+
 try:
     import rasterio
+    from rasterio.features import rasterize as rio_rasterize
 except ImportError:
     print("ERROR: rasterio not found. Install with: pip install rasterio")
     sys.exit(1)
@@ -63,10 +70,9 @@ DATA_DIR             = BASE_DIR / "data"
 META_DIR             = BASE_DIR / "metadata"
 GEE_EXPORTS_DIR      = DATA_DIR / "GEE_exports"
 DCC_ACTIVATIONS_DIR  = DATA_DIR / "activations" / "activations_dcc"
-ACTIVATIONS_CSV      = DATA_DIR / "activations.csv"        # Script 1 output
-GEE_TASKS_CSV         = META_DIR / "gee_tasks_record.csv"
-FLOOD_DATASET_CSV    = DATA_DIR / "flood_dataset.csv"      # primary output
-FLOOD_DATASET_META   = META_DIR / "flood_dataset.csv"      # archival copy
+ACTIVATIONS_CSV      = META_DIR / "activations.csv"
+GEE_TASKS_CSV        = META_DIR / "gee_tasks_record.csv"
+DATASET_METADATA_CSV = META_DIR / "dataset_metadata.csv"
 HYDROBASINS_DIR      = DATA_DIR / "hydrobasins"
 
 # Required layers with expected band counts
@@ -78,6 +84,7 @@ REQUIRED_LAYERS = {
     "ESA_PW": {"files": ["ESA_PW.tif", "ESA_WorldCover_PermanentWater.tif"], "bands": 1},
     "Precipitation": {"files": ["Precipitation.tif"], "bands": 10},
     "SoilMoisture": {"files": ["SoilMoisture.tif"], "bands": 10},
+    "flood_mask": {"files": ["flood_mask.tif"], "bands": 1},
 }
 
 
@@ -345,6 +352,71 @@ def get_basin_id(aoi_shp_path: Path, basins_gdf: gpd.GeoDataFrame) -> Optional[s
         return None
 
 
+# ─── FLOOD MASK RASTERIZATION ────────────────────────────────────────────────
+
+def rasterize_flood_mask(export_folder: Path, dcc_folder: Path) -> bool:
+    """
+    Rasterize flood_extent/event.shp to flood_mask.tif aligned to S1_VV_VH.tif.
+    Binary output: 1 = flooded, 0 = not flooded. Skips if already exists.
+    Returns True on success or if already exists, False on failure.
+    """
+    out_tif   = export_folder / "flood_mask.tif"
+    flood_shp = dcc_folder / "flood_extent" / "event.shp"
+    s1_tif    = export_folder / "S1_VV_VH.tif"
+
+    if out_tif.exists():
+        return True
+
+    if not flood_shp.exists():
+        return False
+
+    if not s1_tif.exists():
+        return False
+
+    try:
+        with rasterio.open(s1_tif) as ref:
+            crs       = ref.crs
+            transform = ref.transform
+            height    = ref.height
+            width     = ref.width
+
+        flood_gdf = gpd.read_file(flood_shp)
+        if flood_gdf.crs and flood_gdf.crs.to_epsg() != crs.to_epsg():
+            flood_gdf = flood_gdf.to_crs(crs)
+
+        shapes = [(geom, 1) for geom in flood_gdf.geometry if geom is not None and not geom.is_empty]
+
+        if shapes:
+            mask = rio_rasterize(
+                shapes,
+                out_shape=(height, width),
+                transform=transform,
+                fill=0,
+                dtype='uint8',
+            )
+        else:
+            mask = np.zeros((height, width), dtype='uint8')
+
+        profile = {
+            'driver': 'GTiff',
+            'dtype': 'uint8',
+            'width': width,
+            'height': height,
+            'count': 1,
+            'crs': crs,
+            'transform': transform,
+            'compress': 'lzw',
+        }
+        with rasterio.open(out_tif, 'w', **profile) as dst:
+            dst.write(mask, 1)
+
+        return True
+
+    except Exception as e:
+        print(f"      ! flood_mask rasterization failed: {e}")
+        return False
+
+
 # ─── MAIN ────────────────────────────────────────────────────────────────────
 
 def find_activation_in_exports(folder_name: str) -> Optional[Path]:
@@ -355,10 +427,10 @@ def find_activation_in_exports(folder_name: str) -> Optional[Path]:
 
 def main():
     print("=" * 72)
-    print("  GEE Exports Validation (Script 4)")
-    print(f"  BASE_DIR              : {BASE_DIR}")
-    print(f"  GEE_EXPORTS_DIR       : {GEE_EXPORTS_DIR}")
-    print(f"  GEE_TASKS_CSV : {GEE_TASKS_CSV}")
+    print("  GEE Output Preprocessing  (Script 4)")
+    print(f"  BASE_DIR        : {BASE_DIR}")
+    print(f"  GEE_EXPORTS_DIR : {GEE_EXPORTS_DIR}")
+    print(f"  GEE_TASKS_CSV   : {GEE_TASKS_CSV}")
     print("=" * 72)
 
     if not GEE_TASKS_CSV.exists():
@@ -374,7 +446,7 @@ def main():
     META_DIR.mkdir(parents=True, exist_ok=True)
 
     # Load HydroBASINS
-    print("\n[1/4] Loading HydroBASINS level 12 data...")
+    print("\n[1/5] Loading HydroBASINS level 12 data...")
     try:
         basins_file = download_hydrobasins_level12()
         if basins_file is None:
@@ -388,7 +460,7 @@ def main():
         basins_gdf = None
 
     # Load gee_tasks_record.csv
-    print("\n[2/4] Loading gee_tasks_record.csv...")
+    print("\n[2/5] Loading gee_tasks_record.csv...")
     try:
         tracking_df = pd.read_csv(GEE_TASKS_CSV)
         print(f"  ✓ Loaded {len(tracking_df)} activations")
@@ -397,7 +469,7 @@ def main():
         sys.exit(1)
 
     # Load activations.csv (sensor info from Script 1)
-    print("\n[3/4] Loading activations.csv (sensor info)...")
+    print("\n[3/5] Loading activations.csv (sensor info)...")
     sensor_lookup: Dict[str, Dict] = {}
     if ACTIVATIONS_CSV.exists():
         try:
@@ -409,31 +481,54 @@ def main():
                 }
             print(f"  ✓ Loaded sensor info for {len(sensor_lookup)} activations")
         except Exception as e:
-            print(f"  ! Could not load activations.csv: {e} — sensor columns will be empty")
+            print(f"  ! Could not load activations.csv: {e} -- sensor columns will be empty")
     else:
-        print(f"  ! activations.csv not found at {ACTIVATIONS_CSV} — sensor columns will be empty")
+        print(f"  ! activations.csv not found at {ACTIVATIONS_CSV} -- sensor columns will be empty")
+
+    # Rasterize flood masks from DCC shapefiles
+    print("\n[4/5] Rasterizing flood masks from CEMS shapefiles...")
+    mask_ok = mask_fail = mask_skip = 0
+    for row in tracking_df.itertuples():
+        folder_name = row.folder_name
+        emsr_code   = folder_name.split("_")[0]
+        export_folder = find_activation_in_exports(folder_name)
+        if export_folder is None:
+            continue
+        dcc_folder = DCC_ACTIVATIONS_DIR / emsr_code / folder_name
+        if (export_folder / "flood_mask.tif").exists():
+            mask_skip += 1
+            continue
+        ok = rasterize_flood_mask(export_folder, dcc_folder)
+        if ok:
+            mask_ok += 1
+            print(f"  ✓ {folder_name}")
+        else:
+            mask_fail += 1
+            print(f"  ✗ {folder_name} -- no flood_extent/event.shp or S1 reference missing")
+    print(f"  Done: {mask_ok} rasterized, {mask_skip} already existed, {mask_fail} failed")
 
     # Validate GEE exports
-    print("\n[4/4] Validating GEE exports...")
+    print("\n[5/5] Validating GEE exports...")
     complete_records = []
     total = len(tracking_df)
     complete_count = 0
 
     for idx, row in tracking_df.iterrows():
         folder_name = row['folder_name']
+        emsr_code   = folder_name.split("_")[0]
 
-        act_folder = find_activation_in_exports(folder_name)
-        if act_folder is None:
+        export_folder = find_activation_in_exports(folder_name)
+        if export_folder is None:
             continue
 
-        is_complete, _, _ = validate_activation(act_folder)
+        is_complete, _, _ = validate_activation(export_folder)
         if not is_complete:
             continue
 
         complete_count += 1
 
         # Detect region from AOI shapefile
-        aoi_shp = DCC_ACTIVATIONS_DIR / folder_name / "aoi" / "aoi.shp"
+        aoi_shp = DCC_ACTIVATIONS_DIR / emsr_code / folder_name / "aoi" / "aoi.shp"
         region = detect_region(aoi_shp) if aoi_shp.exists() else 'unknown'
 
         # Get basin ID
@@ -461,29 +556,27 @@ def main():
         if (idx + 1) % 100 == 0:
             print(f"  Processed {idx + 1}/{total} activations...")
 
-    # Write flood_dataset.csv
+    # Write dataset_metadata.csv
     fieldnames = [
         'folder_name', 'region', 'basin_id',
         'pre_event_sensor', 'post_event_sensors',
         'resolution_post_sensor', 'resolution_class',
     ]
-    for out_path in [FLOOD_DATASET_CSV, FLOOD_DATASET_META]:
-        out_path.parent.mkdir(parents=True, exist_ok=True)
-        with open(out_path, 'w', newline='', encoding='utf-8') as f:
-            writer = csv.DictWriter(f, fieldnames=fieldnames)
-            writer.writeheader()
-            writer.writerows(complete_records)
+    DATASET_METADATA_CSV.parent.mkdir(parents=True, exist_ok=True)
+    with open(DATASET_METADATA_CSV, 'w', newline='', encoding='utf-8') as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(complete_records)
 
     print()
     print("=" * 72)
     print("  SUMMARY")
     print("=" * 72)
-    print(f"  Activations in tracking CSV : {total}")
-    print(f"  Complete (all layers valid) : {complete_count}")
+    print(f"  Activations in tracking CSV  : {total}")
+    print(f"  Flood masks rasterized       : {mask_ok}  (skipped: {mask_skip}, failed: {mask_fail})")
+    print(f"  Complete (all layers valid)  : {complete_count}")
     print()
-    print("  Output files:")
-    print(f"    {FLOOD_DATASET_CSV}")
-    print(f"    {FLOOD_DATASET_META}")
+    print(f"  dataset_metadata.csv -> {DATASET_METADATA_CSV}")
     print("=" * 72)
 
 

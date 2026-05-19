@@ -1,11 +1,12 @@
 # CEMS Flood Dataset Pipeline
 
-A pipeline to build a multi-resolution flood dataset from Copernicus EMSR rapid mapping activations and EO data from GEE. Covers the full workflow from raw CEMS product download and DCC conversion to GEE export submission, Drive retrieval, and final dataset validation. Each processed activation produces 7 analysis-ready GeoTIFFs at mixed resolutions (10 m to 9 km), aligned to a common grid.
+A pipeline to build a multi-resolution flood dataset from Copernicus EMSR rapid mapping activations and EO data from GEE. Covers the full workflow from raw CEMS product download and DCC conversion to GEE export submission, Drive retrieval, and final dataset preprocessing. Each processed activation produces 8 analysis-ready GeoTIFFs at mixed resolutions (10 m to 9 km), including a binary flood mask rasterized from the official CEMS delineation, aligned to a common grid.
 
 **Per-activation GeoTIFF exports (7 files per event):**
 
 | File | Bands | Source | GEE Collection |
 |---|---|---|---|
+| `flood_mask.tif` | 1 (binary: 1=flooded) | Copernicus CEMS flood extent shapefile, 10 m | rasterized from DCC `flood_extent/event.shp` |
 | `S1_VV_VH.tif` | 2 (VV, VH) | Sentinel-1 SAR GRD, 10 m | `COPERNICUS/S1_GRD` |
 | `land_cover.tif` | 2 (NDVI, NDBI) | Sentinel-2 SR, 10 m | `COPERNICUS/S2_SR_HARMONIZED` |
 | `MERIT.tif` | 4 (elevation, flow dir, UDA, HAND) | MERIT Hydro, 90 m | `MERIT/Hydro/v1_0_1` |
@@ -42,11 +43,11 @@ First run of Script 3 will open a browser for OAuth approval.
 ## Pipeline
 
 ```
-1_download_activations.py     Download EMSR flood activations from Copernicus + convert to DCC format
-2_submit_gee_tasks.py         Submit GEE export tasks to Google Drive (7 layers per activation)
-                              # wait for GEE tasks to complete (hours)
-3_download_gee_exports.py     Download all EMSR* folders from Google Drive to data/GEE_exports/
-4_check_exports.py            Validate exports + build dataset_metadata.csv
+1_download_activations.py        Download EMSR flood activations from Copernicus + convert to DCC format
+2_submit_gee_tasks.py            Submit GEE export tasks to Google Drive (7 layers per activation)
+                                 # wait for GEE tasks to complete (hours)
+3_download_gee_exports.py        Download all EMSR* folders from Google Drive to data/GEE_exports/
+4_gee_output_preprocessing.py    Rasterize flood masks + validate exports + build dataset_metadata.csv
 ```
 
 ```bash
@@ -55,7 +56,7 @@ python scripts/1_download_activations.py
 python scripts/2_submit_gee_tasks.py
 # wait for GEE tasks at code.earthengine.google.com/tasks
 python scripts/3_download_gee_exports.py
-python scripts/4_check_exports.py
+python scripts/4_gee_output_preprocessing.py
 ```
 
 ---
