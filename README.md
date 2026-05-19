@@ -34,18 +34,18 @@ First run of Script 3 will open a browser for OAuth approval.
 ```
 1_download_activations.py     Download EMSR flood activations from Copernicus + convert to DCC format
 2_submit_gee_tasks.py         Submit GEE export tasks to Google Drive (7 layers per activation)
-                              ── wait for GEE tasks to complete (hours) ──
-3_download_gee_exports.py     Download all EMSR* folders from Google Drive → data/GEE_exports/
-4_validate_exports.py         Validate exports + build flood_dataset.csv
+                              # wait for GEE tasks to complete (hours)
+3_download_gee_exports.py     Download all EMSR* folders from Google Drive to data/GEE_exports/
+4_check_exports.py            Validate exports + build dataset_metadata.csv
 ```
 
 ```bash
 conda activate cems_pipeline
 python scripts/1_download_activations.py
 python scripts/2_submit_gee_tasks.py
-# wait for GEE tasks at code.earthengine.google.com → Tasks
+# wait for GEE tasks at code.earthengine.google.com/tasks
 python scripts/3_download_gee_exports.py
-python scripts/4_validate_exports.py
+python scripts/4_check_exports.py
 ```
 
 ---
@@ -70,12 +70,12 @@ metadata/
   activations.csv             activation catalog (Script 1)
   activations_status.csv      per-product download + DCC status (Script 1)
   gee_tasks_record.csv        GEE task tracking (Script 2)
-  flood_dataset.csv           final dataset catalog (Script 4)
+  dataset_metadata.csv           final dataset catalog (Script 4)
 ```
 
 ---
 
-## Dataset CSV (`flood_dataset.csv`)
+## Dataset CSV
 
 | column | description |
 |---|---|
