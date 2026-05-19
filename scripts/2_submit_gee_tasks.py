@@ -12,7 +12,7 @@ script submits Google Earth Engine export tasks to Google Drive.
   Soil.tif            2 bands   SoilGrids topsoil clay + sand
   ESA_PW.tif          1 band    ESA WorldCover 2021 permanent water mask
   Precipitation.tif  10 bands   ERA5-Land daily precip (10 days pre-event)
-  SoilMoisture.tif   10 bands   SMAP daily soil moisture (10 days pre-event)
+  SoilMoisture.tif   10 bands   SMAP L4 daily soil moisture (10 days pre-event, NASA/SMAP/SPL4SMGP/007)
 
 Temporal Fallback Strategy (Smart Iterative with Real Coverage Checking):
 
@@ -445,8 +445,11 @@ def update_download_tracking_csv(download_tracker: DownloadTracker):
     tracking_records = []
     missing_records = []
 
-    # Find all activation folders directly under DCC_ACTIVATIONS_DIR
-    activation_folders = sorted([p for p in DCC_ACTIVATIONS_DIR.iterdir() if p.is_dir()])
+    # DCC structure: activations_dcc/{EMSR_CODE}/{activation_folder}/
+    activation_folders = sorted(
+        sub for emsr_dir in DCC_ACTIVATIONS_DIR.iterdir() if emsr_dir.is_dir()
+        for sub in emsr_dir.iterdir() if sub.is_dir()
+    )
 
     if not activation_folders:
         print(f"  ! No activation folders found in {DCC_ACTIVATIONS_DIR}")
@@ -954,7 +957,7 @@ def build_precipitation(region, event_date: date, n_days: int = TEMPORAL_DAYS):
 
 def build_soil_moisture(region, event_date: date, n_days: int = TEMPORAL_DAYS):
     """
-    SMAP 10km surface soil moisture for n_days ending on event_date.
+    SMAP L4 surface soil moisture (NASA/SMAP/SPL4SMGP/007) for n_days ending on event_date.
     Returns n_days-band image; bands named 'SM_YYYYMMDD' oldest→newest.
     """
     bands = []
@@ -964,9 +967,9 @@ def build_soil_moisture(region, event_date: date, n_days: int = TEMPORAL_DAYS):
         start = d.isoformat()
         end   = (d + timedelta(days=1)).isoformat()
         img = (
-            ee.ImageCollection("NASA_USDA/HSL/SMAP10KM_soil_moisture")
+            ee.ImageCollection("NASA/SMAP/SPL4SMGP/008")
             .filterDate(start, end)
-            .select("ssm")
+            .select("sm_surface")
             .first()
             .rename(f"SM_{dstr}")
             .unmask(-9999)
@@ -1014,8 +1017,10 @@ def submit_for_activation(dcc_folder: Path, download_tracker: DownloadTracker) -
         return f"{dcc_name}/{layer}"
 
     def desc(layer: str) -> str:
-        # GEE task description ≤100 chars
-        return f"{dcc_name[:70]}_{layer}"
+        import unicodedata, re as _re
+        safe = unicodedata.normalize("NFKD", dcc_name).encode("ascii", "ignore").decode("ascii")
+        safe = _re.sub(r"[^a-zA-Z0-9._,:;\-]", "_", safe)
+        return f"{safe[:70]}_{layer}"
 
     # ── S1 ──────────────────────────────────────────────────────────────
     if download_tracker.needs_submission(dcc_name, "S1"):
@@ -1144,8 +1149,12 @@ def main():
             print("  Run Script 1 first to download + convert activations.")
             sys.exit(1)
 
-        # Find all activation folders directly under DCC_ACTIVATIONS_DIR
-        folders = sorted(p for p in DCC_ACTIVATIONS_DIR.iterdir() if p.is_dir())
+        # DCC structure: activations_dcc/{EMSR_CODE}/{activation_folder}/
+        # Collect all activation subfolders (one level below EMSR parent)
+        folders = sorted(
+            sub for emsr_dir in DCC_ACTIVATIONS_DIR.iterdir() if emsr_dir.is_dir()
+            for sub in emsr_dir.iterdir() if sub.is_dir()
+        )
         if not folders:
             print(f"\n! No activation folders in {DCC_ACTIVATIONS_DIR}")
             sys.exit(1)

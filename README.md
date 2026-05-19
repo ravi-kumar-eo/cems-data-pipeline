@@ -13,7 +13,7 @@ A pipeline to build a multi-resolution flood dataset from Copernicus EMSR rapid 
 | `Soil.tif` | 2 (clay, sand) | OpenLandMap SoilGrids, 250 m | `OpenLandMap/SOL/...` |
 | `ESA_PW.tif` | 1 (permanent water mask) | ESA WorldCover, 10 m | `ESA/WorldCover/v200` |
 | `Precipitation.tif` | 10 (daily, 10 days pre-event) | ERA5-Land daily, 9 km | `ECMWF/ERA5_LAND/DAILY_AGGR` |
-| `SoilMoisture.tif` | 10 (daily, 10 days pre-event) | SMAP 10 km, 10 km | `NASA_USDA/HSL/SMAP10KM_soil_moisture` |
+| `SoilMoisture.tif` | 10 (daily, 10 days pre-event) | SMAP L4 surface SM, 9 km | `NASA/SMAP/SPL4SMGP/007` |
 
 ---
 
