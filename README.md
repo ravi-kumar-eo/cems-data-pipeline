@@ -1,8 +1,8 @@
 # CEMS Flood Dataset Pipeline
 
-A pipeline to build a multi-modal flood dataset from Copernicus EMSR activations and Google Earth Engine satellite exports.
+A pipeline to build a multi-resolution flood dataset from Copernicus EMSR rapid mapping activations and EO data from GEE. Covers the full workflow from raw CEMS product download and DCC conversion to GEE export submission, Drive retrieval, and final dataset validation. Each processed activation produces 7 analysis-ready GeoTIFFs at mixed resolutions (10 m to 9 km), aligned to a common grid.
 
-**What it produces:** One folder per flood event containing 7 stacked GeoTIFFs (Sentinel-1, Sentinel-2 indices, MERIT DEM, soil, ESA permanent water, ERA5 precipitation, SMAP soil moisture).
+**Per-activation GeoTIFF exports:** `S1_VV_VH.tif` (2-band Sentinel-1 SAR, 10 m), `land_cover.tif` (NDVI + NDBI from Sentinel-2, 10 m), `MERIT.tif` (elevation / flow direction / UDA / HAND, 90 m), `Soil.tif` (clay + sand fraction from SoilGrids, 250 m), `ESA_PW.tif` (permanent water mask, 10 m), `Precipitation.tif` (10-day ERA5-Land daily stack, 9 km), `SoilMoisture.tif` (10-day SMAP daily stack, 9 km)
 
 ---
 
