@@ -907,6 +907,7 @@ def build_merit(region):
     merit = ee.Image("MERIT/Hydro/v1_0_1")
     return (
         merit.select(["elv", "dir", "upa", "hnd"])
+             .toFloat()
              .rename(["Elevation", "FlowDirection", "UDA", "HAND"])
              .unmask(-9999)
     )
@@ -943,14 +944,12 @@ def build_precipitation(region, event_date: date, n_days: int = TEMPORAL_DAYS):
         dstr  = d.strftime("%Y%m%d")
         start = d.isoformat()
         end   = (d + timedelta(days=1)).isoformat()
-        img = (
-            ee.ImageCollection("ECMWF/ERA5_LAND/DAILY_AGGR")
-            .filterDate(start, end)
-            .select("total_precipitation_sum")
-            .first()
-            .rename(f"Precipitation_{dstr}")
-            .unmask(-9999)
-        )
+        col = ee.ImageCollection("ECMWF/ERA5_LAND/DAILY_AGGR").filterDate(start, end).select("total_precipitation_sum")
+        img = ee.Image(ee.Algorithms.If(
+            col.size().gt(0),
+            col.first().rename(f"Precipitation_{dstr}"),
+            ee.Image.constant(-9999).rename(f"Precipitation_{dstr}").toFloat()
+        )).unmask(-9999)
         bands.append(img)
     return ee.Image(bands)
 
@@ -966,14 +965,12 @@ def build_soil_moisture(region, event_date: date, n_days: int = TEMPORAL_DAYS):
         dstr  = d.strftime("%Y%m%d")
         start = d.isoformat()
         end   = (d + timedelta(days=1)).isoformat()
-        img = (
-            ee.ImageCollection("NASA/SMAP/SPL4SMGP/008")
-            .filterDate(start, end)
-            .select("sm_surface")
-            .first()
-            .rename(f"SM_{dstr}")
-            .unmask(-9999)
-        )
+        col = ee.ImageCollection("NASA/SMAP/SPL4SMGP/008").filterDate(start, end).select("sm_surface")
+        img = ee.Image(ee.Algorithms.If(
+            col.size().gt(0),
+            col.first().rename(f"SM_{dstr}"),
+            ee.Image.constant(-9999).rename(f"SM_{dstr}").toFloat()
+        )).unmask(-9999)
         bands.append(img)
     return ee.Image(bands)
 
