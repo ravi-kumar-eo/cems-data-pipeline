@@ -8,3 +8,4 @@ numpy>=1.23
 pandas>=1.5
 shapely>=2.0
 google-auth-oauthlib>=1.0
+google-api-python-client>=2.80

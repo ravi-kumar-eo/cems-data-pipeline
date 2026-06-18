@@ -7,8 +7,8 @@ Pipeline steps (all in one script, resumable):
   2. Download raw vectors + PDFs for each flood activation
   3. Find PDF per product, extract acquisition date
   4. Extract data sources (pre/post-event sensor info) from PDF → CSV
-  5. Validate required shapefiles (aoi, event, hydro)
-  6. Convert to DCC format (flat folders: aoi/, event/, hydro/)
+  5. Validate required shapefiles (aoi, event)
+  6. Convert to DCC format (flat folders: aoi/, flood_extent/)
 
 Resume logic:
   - data/metadata/activations_status.csv tracks per-product state
@@ -25,8 +25,7 @@ Output structure (relative to BASE_DIR, auto-detected from script location):
   │       └── EMSR657/                          ← activation parent folder
   │           └── EMSR657_AOI01_DaugavaRiver_DEL_MONIT01_20230402/
   │               ├── aoi/aoi.shp          (+ .shx .dbf .prj ...)
-  │               ├── flood_extent/event.shp
-  │               └── permanent_water/hydroA.shp   (if available)
+  │               └── flood_extent/event.shp
   └── data/
       ├── activations_status.csv  ← internal per-product processing state
       ├── activations_sources.csv ← internal pre/post-event sensor info from PDFs
@@ -111,14 +110,15 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 BASE_DIR    = Path(__file__).resolve().parent.parent   # repo root
 DATA_DIR    = BASE_DIR / "data"
-META_DIR    = BASE_DIR / "metadata"
+META_DIR    = DATA_DIR / "metadata"
 ACTIVATIONS = DATA_DIR / "activations"
 RAW_DIR     = ACTIVATIONS / "activations_raw"
 DCC_DIR     = ACTIVATIONS / "activations_dcc"
 TEMP_DIR    = DATA_DIR / "_temp"
 
-STATUS_CSV  = META_DIR / "activations_status.csv"     # internal resume state
-CATALOG_CSV = META_DIR / "activations.csv"             # output catalog
+import config
+STATUS_CSV  = config.CSV_ACTIVATION_STATUS    # 1_activation_status.csv (resume state)
+CATALOG_CSV = config.CSV_ACTIVATION_CATALOG   # 1_activation_catalog.csv (output catalog)
 
 
 # ─── STATUS TRACKER ──────────────────────────────────────────────────────────
@@ -127,7 +127,7 @@ STATUS_FIELDS = [
     "emsr_code", "product_folder", "event_type",
     "raw_downloaded", "pdf_found", "date_extracted", "event_date",
     "pre_event_sensor", "post_event_sensors",
-    "dcc_folder", "dcc_converted", "has_aoi", "has_event", "has_hydro",
+    "dcc_folder", "dcc_converted", "has_aoi", "has_event",
     "skipped_reason", "last_updated",
 ]
 
@@ -1139,7 +1139,7 @@ class PDFParser:
 
 class ShapefileFinder:
     """
-    Locates aoi, event, and hydrography shapefiles inside a product folder.
+    Locates aoi and event (flood extent) shapefiles inside a product folder.
     Handles both old (VECTOR/ subfolder) and new (flat) layouts.
     """
 
@@ -1208,17 +1208,6 @@ class ShapefileFinder:
                 return f
         return None
 
-    def find_hydro(self, product_dir: Path) -> Optional[Path]:
-        search = self._search_dir(product_dir)
-        # Must be polygon/area (not line/point)
-        for kws in [["hydrogra"], ["hydrology"]]:
-            f = self._find_shp(search, kws,
-                               exclude=["_line", "_point"],
-                               require_any=["_a", "_poly", "a.shp"])
-            if f:
-                return f
-        return None
-
 
 # ─── DCC CONVERTER ───────────────────────────────────────────────────────────
 
@@ -1226,38 +1215,34 @@ class DCCConverter:
     """
     Copies shapefiles from a raw product folder into DCC format:
       data/activations/{dcc_folder_name}/
-        aoi/aoi.{shp,shx,dbf,prj,...}
-        event/event.{shp,...}
-        hydro/hydroA.{shp,...}      (hydro is optional)
+        aoi/aoi.{shp,shx,dbf,prj,...}            mapped area-of-interest footprint
+        flood_extent/event.{shp,...}             observed flood delineation (label)
+
+    Only these two CEMS components are kept. The pre-event hydrography (hydroA)
+    is not used: CEMS stopped shipping it after early 2023, so the permanent
+    water layer is defined from ESA WorldCover alone (Step 4) for every event.
     """
 
     def __init__(self):
         self.finder = ShapefileFinder()
 
     def convert(self, product_dir: Path, dcc_folder: Path) -> Tuple[bool, Dict[str, bool], str]:
-        """
-        Returns (overall_success, {has_aoi, has_event, has_hydro}, message).
-        Skips the permanent_water subfolder gracefully if no hydrography shapefile is found.
-        """
+        """Returns (overall_success, {has_aoi, has_event}, message)."""
         if dcc_folder.exists() and (dcc_folder / "aoi" / "aoi.shp").exists():
-            return True, {"aoi": True, "event": True, "hydro": (dcc_folder / "permanent_water" / "hydroA.shp").exists()}, "already done"
+            return True, {"aoi": True, "event": True}, "already done"
 
         aoi_shp   = self.finder.find_aoi(product_dir)
         event_shp = self.finder.find_event(product_dir)
-        hydro_shp = self.finder.find_hydro(product_dir)
 
         if not aoi_shp:
-            return False, {"aoi": False, "event": bool(event_shp), "hydro": bool(hydro_shp)}, "missing aoi shapefile"
+            return False, {"aoi": False, "event": bool(event_shp)}, "missing aoi shapefile"
 
-        # Both aoi and event found → proceed; permanent_water is optional
         dcc_folder.mkdir(parents=True, exist_ok=True)
 
-        self._copy_shp(aoi_shp,   dcc_folder / "aoi",              "aoi")
-        self._copy_shp(event_shp, dcc_folder / "flood_extent",     "event")
-        if hydro_shp:
-            self._copy_shp(hydro_shp, dcc_folder / "permanent_water", "hydroA")
+        self._copy_shp(aoi_shp,   dcc_folder / "aoi",          "aoi")
+        self._copy_shp(event_shp, dcc_folder / "flood_extent", "event")
 
-        return True, {"aoi": True, "event": True, "hydro": bool(hydro_shp)}, "ok"
+        return True, {"aoi": True, "event": True}, "ok"
 
     @staticmethod
     def _copy_shp(src: Path, dest_dir: Path, new_stem: str):
@@ -1417,6 +1402,8 @@ def main():
             return
 
     # Initialise helpers
+    META_DIR.mkdir(parents=True, exist_ok=True)
+    config.migrate_csv_names()  # rename any old-named metadata files in place
     status   = StatusTracker(STATUS_CSV)
     dl       = EMSRDownloader()
     pdf_p    = PDFParser()
@@ -1530,7 +1517,7 @@ def main():
 
             if ok:
                 print(f"      ✓  DCC → {code}/{dcc_name}  "
-                      f"[aoi={flags['aoi']} flood_extent={flags['event']} permanent_water={flags['hydro']}]")
+                      f"[aoi={flags['aoi']} flood_extent={flags['event']}]")
                 stats["dcc_ok"] += 1
                 status.upsert({
                     "emsr_code":      code,
@@ -1539,7 +1526,6 @@ def main():
                     "dcc_converted":  "yes",
                     "has_aoi":        "yes" if flags["aoi"]   else "no",
                     "has_event":      "yes" if flags["event"] else "no",
-                    "has_hydro":      "yes" if flags["hydro"] else "no",
                 })
             else:
                 print(f"      ✗  DCC failed: {msg}")
@@ -1551,7 +1537,6 @@ def main():
                     "skipped_reason": msg,
                     "has_aoi":        "yes" if flags.get("aoi")   else "no",
                     "has_event":      "yes" if flags.get("event") else "no",
-                    "has_hydro":      "yes" if flags.get("hydro") else "no",
                 })
 
             time.sleep(REQUEST_DELAY)

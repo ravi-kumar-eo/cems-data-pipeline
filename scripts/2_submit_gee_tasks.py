@@ -10,9 +10,9 @@ script submits Google Earth Engine export tasks to Google Drive.
   land_cover.tif      2 bands   NDVI + NDBI from S2 with temporal fallback (both at 10m)
   MERIT.tif           4 bands   MERIT Hydro (elevation, flow dir, UDA, HAND)
   Soil.tif            2 bands   SoilGrids topsoil clay + sand
-  ESA_PW.tif          1 band    ESA WorldCover 2021 permanent water mask
-  Precipitation.tif  10 bands   ERA5-Land daily precip (10 days pre-event)
-  SoilMoisture.tif   10 bands   SMAP L4 daily soil moisture (10 days pre-event, NASA/SMAP/SPL4SMGP/007)
+  ESA_WorldCover_PermanentWater.tif  1 band  ESA WorldCover 2021 permanent water
+  Precipitation_{first}_{last}.tif  30 bands  GPM-IMERG V07 daily precip (30 antecedent days, event excluded)
+  SoilMoisture_{first}_{last}.tif   30 bands  SMAP L4 daily soil moisture (30 antecedent days, NASA/SMAP/SPL4SMGP/008)
 
 Temporal Fallback Strategy (Smart Iterative with Real Coverage Checking):
 
@@ -70,12 +70,12 @@ Band names inside each TIF encode the layer name / date, e.g.:
   MERIT.tif         → bands named 'Elevation', 'FlowDirection', 'UDA', 'HAND'
 
 Download tracking:
-  metadata/gee_tasks_record.csv tracks layer availability per activation:
+  data/metadata/2_gee_export_status.csv tracks layer availability per activation:
     - "NA" = No GEE images available (won't retry)
     - "no" = Not yet submitted / not available in exports
     - "yes" = File exists and passes validation
   Activations with any "NA" layer are skipped automatically.
-  metadata/missing_flood_extent.csv lists activations without flood extent.
+  Activations without a flood-extent polygon are skipped.
 
 Modes:
   Edit SUBMIT_TO_GEE in CONFIG section to "yes" or "no"
@@ -90,7 +90,8 @@ After GEE completes (typically hours):
 
 # ─── CONFIG ──────────────────────────────────────────────────────────────────
 SUBMIT_TO_GEE    = "yes"             # yes or no - whether to submit tasks to GEE
-TEMPORAL_DAYS    = 10               # days of pre-event precip / SM to export
+# Temporal-layer length (precip / soil moisture days) and which layers to export
+# are now set in config.py (N_DAYS_OVERRIDE, LAYER_TOGGLES).
 
 # TEST MODE: Process only first activation folder (for testing)
 TEST_MODE = False                   # Set to True to process only first valid activation
@@ -110,9 +111,16 @@ S2_COVERAGE_THRESHOLD = 0.98        # If coverage < 98%, add seasonal fallback
 S2_USE_SEASONAL_FALLBACK = True     # Enable/disable seasonal fallback
 S2_SEASONAL_STRATEGY = 'auto'       # 'auto' = next year for early events, prev year for recent
 
-# GEE export pixel size (degrees) - reference grid for alignment
-# Note: each layer has its native resolution; GEE resamples to this grid
-PIXEL_DEG        = 0.0001           # ~10m at equator
+# GEE export pixel size (degrees) - fine reference grid for the 10 m layers.
+# S1, S2 indices and ESA_PW are exported on this grid. MERIT (90 m) and SoilGrids
+# (250 m) are exported on their own native-resolution grid over the same AOI.
+PIXEL_DEG        = 0.0001           # ~10m at equator (S1, S2, ESA_PW)
+
+# Temporal layers (precip / soil moisture) are exported at their NATIVE coarse
+# resolution over an AOI bbox expanded by config.TEMPORAL_BUFFER_DEG, so every
+# patch later has a full spatial neighbourhood grid around it.
+PRECIP_DEG        = 0.1             # GPM-IMERG V07 native resolution (~11.1 km)
+SMAP_DEG          = 0.09516         # SMAP SPL4SMGP native resolution (~9.5 km)
 
 REQUEST_DELAY    = 5                # seconds between GEE task submissions
 # ─────────────────────────────────────────────────────────────────────────────
@@ -126,6 +134,9 @@ import time
 from datetime import date, timedelta
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
+
+import config
+from config import enabled_layers, enabled_keys
 
 try:
     import ee
@@ -154,17 +165,13 @@ except ImportError:
 
 BASE_DIR     = Path(__file__).resolve().parent.parent
 DATA_DIR     = BASE_DIR / "data"
-META_DIR     = BASE_DIR / "metadata"
+META_DIR     = DATA_DIR / "metadata"
 DCC_ACTIVATIONS_DIR = DATA_DIR / "activations" / "activations_dcc"
 GEE_EXPORTS_DIR = DATA_DIR / "GEE_exports"
-GEE_TASKS_CSV            = META_DIR / "gee_tasks_record.csv"
-MISSING_FLOOD_EXTENT_CSV = META_DIR / "missing_flood_extent.csv"
+GEE_TASKS_CSV            = config.CSV_GEE_EXPORT_STATUS
 
-# Layer names that this script exports (order matters for reporting)
-ALL_LAYERS = [
-    "S1", "S2_indices", "MERIT", "Soil", "ESA_PW",
-    "Precipitation", "SoilMoisture",
-]
+# Layers this run exports, in registry order, after applying config toggles.
+ALL_LAYERS = enabled_keys()
 
 
 # ─── DOWNLOAD TRACKER ────────────────────────────────────────────────────────
@@ -274,6 +281,17 @@ def _read_aoi_bounds(dcc_folder: Path) -> Optional[Tuple[float, float, float, fl
     except Exception as e:
         print(f"      ! could not read AOI shapefile: {e}")
         return None
+
+
+def _buffer_bounds(minx: float, miny: float, maxx: float, maxy: float,
+                   buffer_deg: float) -> Tuple[float, float, float, float]:
+    """Expand a lon/lat bbox by buffer_deg on every side (clamped to valid range)."""
+    return (
+        max(minx - buffer_deg, -180.0),
+        max(miny - buffer_deg,  -90.0),
+        min(maxx + buffer_deg,  180.0),
+        min(maxy + buffer_deg,   90.0),
+    )
 
 
 def _snap_bounds(minx: float, miny: float, maxx: float, maxy: float,
@@ -423,11 +441,11 @@ def find_layer_in_exports(folder_name: str, layer_name: str) -> Optional[Path]:
 
 def update_download_tracking_csv(download_tracker: DownloadTracker):
     """
-    Scan activations_dcc and GEE_exports to update download tracking CSVs.
+    Scan activations_dcc and GEE_exports to update the export-status CSV.
 
     Creates:
-        - metadata/download_tracking.csv: activations with flood extent
-        - metadata/missing_flood_extent.csv: activations without flood extent
+        - the per-layer GEE export-status CSV (config.CSV_GEE_EXPORT_STATUS),
+          one row per activation that has a flood-extent polygon.
 
     Only processes activations from 2017 onwards.
 
@@ -443,7 +461,6 @@ def update_download_tracking_csv(download_tracker: DownloadTracker):
         return
 
     tracking_records = []
-    missing_records = []
 
     # DCC structure: activations_dcc/{EMSR_CODE}/{activation_folder}/
     activation_folders = sorted(
@@ -468,13 +485,8 @@ def update_download_tracking_csv(download_tracker: DownloadTracker):
 
             flood_extent_shp = act_folder / "flood_extent" / "event.shp"
 
-            # Check if flood extent exists
+            # Skip activations without a flood-extent polygon.
             if not flood_extent_shp.exists():
-                missing_records.append({
-                    'EMSR_code': emsr_code,
-                    'folder_name': folder_name,
-                    'reason': 'Missing flood_extent/event.shp',
-                })
                 continue
 
             # Get existing record to preserve NA statuses
@@ -486,15 +498,12 @@ def update_download_tracking_csv(download_tracker: DownloadTracker):
                 'folder_name': folder_name,
             }
 
-            # Layers to check: (name, filename, expected_bands, needs_coverage_check)
+            # Layers to check come from the enabled registry: composite layers
+            # (S1, S2 indices) additionally get an AOI-coverage check.
             layers_to_check = [
-                ('S1', 'S1_VV_VH.tif', 2, True),
-                ('S2_indices', 'land_cover.tif', 2, True),
-                ('MERIT', 'MERIT.tif', 4, False),
-                ('Soil', 'Soil.tif', 2, False),
-                ('ESA_PW', 'ESA_PW.tif', 1, False),
-                ('Precipitation', 'Precipitation.tif', 10, False),
-                ('SoilMoisture', 'SoilMoisture.tif', 10, False),
+                (spec.key, spec.filename, spec.band_count(),
+                 spec.kind == "composite")
+                for spec in enabled_layers()
             ]
 
             for layer_key, layer_file, expected_bands, needs_coverage in layers_to_check:
@@ -526,25 +535,14 @@ def update_download_tracking_csv(download_tracker: DownloadTracker):
 
     if tracking_records:
         with open(GEE_TASKS_CSV, 'w', newline='', encoding='utf-8') as f:
-            fieldnames = ['EMSR_code', 'folder_name', 'S1', 'S2_indices',
-                         'MERIT', 'Soil', 'ESA_PW', 'Precipitation', 'SoilMoisture']
-            writer = csv.DictWriter(f, fieldnames=fieldnames)
+            fieldnames = ['EMSR_code', 'folder_name'] + ALL_LAYERS
+            writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction='ignore')
             writer.writeheader()
             writer.writerows(tracking_records)
 
         print(f"  ✓ Written {len(tracking_records)} records to {GEE_TASKS_CSV}")
     else:
         print(f"  ! No activations with flood extent found")
-
-    # Write missing flood extent CSV
-    if missing_records:
-        with open(MISSING_FLOOD_EXTENT_CSV, 'w', newline='', encoding='utf-8') as f:
-            fieldnames = ['EMSR_code', 'folder_name', 'reason']
-            writer = csv.DictWriter(f, fieldnames=fieldnames)
-            writer.writeheader()
-            writer.writerows(missing_records)
-
-        print(f"  ✓ Written {len(missing_records)} records to {MISSING_FLOOD_EXTENT_CSV}")
 
 
 # ─── GEE IMAGE BUILDERS ───────────────────────────────────────────────────────
@@ -902,79 +900,6 @@ def build_s2_indices(region, event_date: date):
         return current_year_result.unmask(-9999)
 
 
-def build_merit(region):
-    """MERIT Hydro 4-band: Elevation, FlowDirection, UDA, HAND."""
-    merit = ee.Image("MERIT/Hydro/v1_0_1")
-    return (
-        merit.select(["elv", "dir", "upa", "hnd"])
-             .toFloat()
-             .rename(["Elevation", "FlowDirection", "UDA", "HAND"])
-             .unmask(-9999)
-    )
-
-
-def build_soil(region):
-    """SoilGrids topsoil (0 cm) clay + sand percentage."""
-    clay = (
-        ee.Image("OpenLandMap/SOL/SOL_CLAY-WFRACTION_USDA-3A1A1A_M/v02")
-        .select("b0").rename("Clay")
-    )
-    sand = (
-        ee.Image("OpenLandMap/SOL/SOL_SAND-WFRACTION_USDA-3A1A1A_M/v02")
-        .select("b0").rename("Sand")
-    )
-    return ee.Image.cat([clay, sand]).unmask(-9999)
-
-
-def build_esa_pw(region):
-    """ESA WorldCover 2021 permanent water (class 80) binary mask."""
-    esa = ee.ImageCollection("ESA/WorldCover/v200").first()
-    pw  = esa.eq(80).rename("PermanentWater").toUint8()
-    return pw.unmask(0)
-
-
-def build_precipitation(region, event_date: date, n_days: int = TEMPORAL_DAYS):
-    """
-    ERA5-Land daily total precipitation for n_days ending on event_date.
-    Returns n_days-band image; bands named 'Precipitation_YYYYMMDD' oldest→newest.
-    """
-    bands = []
-    for offset in range(n_days - 1, -1, -1):   # oldest first
-        d     = event_date - timedelta(days=offset)
-        dstr  = d.strftime("%Y%m%d")
-        start = d.isoformat()
-        end   = (d + timedelta(days=1)).isoformat()
-        col = ee.ImageCollection("ECMWF/ERA5_LAND/DAILY_AGGR").filterDate(start, end).select("total_precipitation_sum")
-        img = ee.Image(ee.Algorithms.If(
-            col.size().gt(0),
-            col.first().rename(f"Precipitation_{dstr}"),
-            ee.Image.constant(-9999).rename(f"Precipitation_{dstr}").toFloat()
-        )).unmask(-9999)
-        bands.append(img)
-    return ee.Image(bands)
-
-
-def build_soil_moisture(region, event_date: date, n_days: int = TEMPORAL_DAYS):
-    """
-    SMAP L4 surface soil moisture (NASA/SMAP/SPL4SMGP/007) for n_days ending on event_date.
-    Returns n_days-band image; bands named 'SM_YYYYMMDD' oldest→newest.
-    """
-    bands = []
-    for offset in range(n_days - 1, -1, -1):   # oldest first
-        d     = event_date - timedelta(days=offset)
-        dstr  = d.strftime("%Y%m%d")
-        start = d.isoformat()
-        end   = (d + timedelta(days=1)).isoformat()
-        col = ee.ImageCollection("NASA/SMAP/SPL4SMGP/008").filterDate(start, end).select("sm_surface")
-        img = ee.Image(ee.Algorithms.If(
-            col.size().gt(0),
-            col.first().rename(f"SM_{dstr}"),
-            ee.Image.constant(-9999).rename(f"SM_{dstr}").toFloat()
-        )).unmask(-9999)
-        bands.append(img)
-    return ee.Image(bands)
-
-
 # ─── MAIN ────────────────────────────────────────────────────────────────────
 
 def submit_for_activation(dcc_folder: Path, download_tracker: DownloadTracker) -> int:
@@ -1019,74 +944,60 @@ def submit_for_activation(dcc_folder: Path, download_tracker: DownloadTracker) -
         safe = _re.sub(r"[^a-zA-Z0-9._,:;\-]", "_", safe)
         return f"{safe[:70]}_{layer}"
 
-    # ── S1 ──────────────────────────────────────────────────────────────
-    if download_tracker.needs_submission(dcc_name, "S1"):
-        print(f"      → S1")
-        img = build_s1(region, event_date)
-        if img is None:
-            print(f"        ✗ Marked as NA (no images available)")
-            download_tracker.mark_layer_na(emsr_code, dcc_name, "S1")
-        else:
-            ok = _submit(img, desc("S1"), prefix("S1"),
-                        region, crs_tf, dcc_name, "S1")
-            submitted += int(ok)
-            time.sleep(REQUEST_DELAY)
+    # Resolution (degrees) per layer key for the temporal layers' own grid.
+    TEMPORAL_DEG = {"Precipitation": PRECIP_DEG, "SoilMoisture": SMAP_DEG}
+    # Buffered AOI bbox for temporal layers, so every patch later has a full
+    # spatial neighbourhood of coarse weather pixels around it. The buffer width
+    # is a user knob (config.TEMPORAL_BUFFER_DEG); widen it to capture upstream
+    # rainfall and soil moisture that drive downstream discharge.
+    buf = _buffer_bounds(*bounds, config.TEMPORAL_BUFFER_DEG)
 
-    # ── S2 indices ───────────────────────────────────────────────────────
-    if download_tracker.needs_submission(dcc_name, "S2_indices"):
-        print(f"      → S2_indices")
-        img = build_s2_indices(region, event_date)
-        if img is None:
-            print(f"        ✗ Marked as NA (no images available)")
-            download_tracker.mark_layer_na(emsr_code, dcc_name, "S2_indices")
-        else:
-            ok = _submit(img, desc("S2_indices"), prefix("S2_indices"),
-                        region, crs_tf, dcc_name, "S2_indices")
-            submitted += int(ok)
-            time.sleep(REQUEST_DELAY)
+    # Composite builders (S1, S2 indices) live in this script; refer to them by
+    # the builder_name carried in the registry.
+    COMPOSITE_BUILDERS = {"build_s1": build_s1, "build_s2_indices": build_s2_indices}
 
-    # ── MERIT ────────────────────────────────────────────────────────────
-    if download_tracker.needs_submission(dcc_name, "MERIT"):
-        print(f"      → MERIT")
-        img = build_merit(region)
-        ok = _submit(img, desc("MERIT"), prefix("MERIT"),
-                    region, crs_tf, dcc_name, "MERIT")
-        submitted += int(ok)
-        time.sleep(REQUEST_DELAY)
+    # Submit one task per enabled layer, dispatched by kind.
+    for spec in enabled_layers():
+        key = spec.key
+        if not download_tracker.needs_submission(dcc_name, key):
+            continue
+        print(f"      → {key}")
 
-    # ── Soil ─────────────────────────────────────────────────────────────
-    if download_tracker.needs_submission(dcc_name, "Soil"):
-        print(f"      → Soil")
-        img = build_soil(region)
-        ok = _submit(img, desc("Soil"), prefix("Soil"),
-                    region, crs_tf, dcc_name, "Soil")
-        submitted += int(ok)
-        time.sleep(REQUEST_DELAY)
+        if spec.kind == "composite":
+            build = COMPOSITE_BUILDERS[spec.builder_name]
+            img = build(region, event_date)
+            if img is None:
+                print(f"        ✗ Marked as NA (no images available)")
+                download_tracker.mark_layer_na(emsr_code, dcc_name, key)
+                continue
+            ok = _submit(img, desc(key), prefix(key), region, crs_tf, dcc_name, key)
 
-    # ── ESA PW ───────────────────────────────────────────────────────────
-    if download_tracker.needs_submission(dcc_name, "ESA_PW"):
-        print(f"      → ESA_PW")
-        img = build_esa_pw(region)
-        ok = _submit(img, desc("ESA_PW"), prefix("ESA_PW"),
-                    region, crs_tf, dcc_name, "ESA_PW")
-        submitted += int(ok)
-        time.sleep(REQUEST_DELAY)
+        elif spec.kind == "temporal":
+            deg = TEMPORAL_DEG.get(key, spec.resolution_m / 111000.0)
+            t_minx, t_miny, t_maxx, t_maxy, t_tf = _snap_bounds(*buf, deg)
+            t_region = _gee_region(t_minx, t_miny, t_maxx, t_maxy)
+            img = spec.builder(t_region, event_date, spec.n_days)
+            # Stamp the antecedent window into the filename: oldest day (event
+            # date minus n_days) and newest day (event date minus 1, event day
+            # excluded), e.g. Precipitation_20200714_20200812.tif.
+            first_day = (event_date - timedelta(days=spec.n_days)).strftime("%Y%m%d")
+            last_day  = (event_date - timedelta(days=1)).strftime("%Y%m%d")
+            dated = f"{spec.filename[:-4]}_{first_day}_{last_day}"
+            ok = _submit(img, desc(dated), prefix(dated), t_region, t_tf, dcc_name, key)
 
-    # ── Precipitation ─────────────────────────────────────────────────────
-    if download_tracker.needs_submission(dcc_name, "Precipitation"):
-        print(f"      → Precipitation")
-        img = build_precipitation(region, event_date)
-        ok = _submit(img, desc("Precip"), prefix("Precipitation"),
-                    region, crs_tf, dcc_name, "Precipitation")
-        submitted += int(ok)
-        time.sleep(REQUEST_DELAY)
+        else:  # static
+            img = spec.builder(region)
+            # Export each static layer on its own native-resolution grid over the
+            # same AOI footprint. ESA_PW (10 m) lands on the fine reference grid;
+            # MERIT (90 m) and SoilGrids (250 m) keep their coarse native pixels.
+            if abs(spec.resolution_m - 10.0) < 1e-6:
+                ok = _submit(img, desc(key), prefix(key), region, crs_tf, dcc_name, key)
+            else:
+                deg = spec.resolution_m / 111000.0
+                s_minx, s_miny, s_maxx, s_maxy, s_tf = _snap_bounds(*bounds, deg)
+                s_region = _gee_region(s_minx, s_miny, s_maxx, s_maxy)
+                ok = _submit(img, desc(key), prefix(key), s_region, s_tf, dcc_name, key)
 
-    # ── Soil Moisture ─────────────────────────────────────────────────────
-    if download_tracker.needs_submission(dcc_name, "SoilMoisture"):
-        print(f"      → SoilMoisture")
-        img = build_soil_moisture(region, event_date)
-        ok = _submit(img, desc("SM"), prefix("SoilMoisture"),
-                    region, crs_tf, dcc_name, "SoilMoisture")
         submitted += int(ok)
         time.sleep(REQUEST_DELAY)
 
@@ -1113,7 +1024,10 @@ def main():
         print(f"  Mode             : TRACKING ONLY (submit_to_gee=no)")
     else:
         print(f"  Mode             : SUBMIT TO GEE (submit_to_gee=yes)")
+    print(f"  Layers enabled   : {', '.join(ALL_LAYERS)}")
     print("=" * 72)
+
+    config.migrate_csv_names()  # rename any old-named metadata files in place
 
     # ── Authenticate GEE ─────────────────────────────────────────────────
     if submit_to_gee and not status_only:
@@ -1236,7 +1150,6 @@ def main():
         print("=" * 72)
         print("  Download tracking CSV updated (GEE submission skipped)")
         print(f"  Tracking CSV: {GEE_TASKS_CSV}")
-        print(f"  Missing flood extent CSV: {MISSING_FLOOD_EXTENT_CSV}")
         print("=" * 72)
 
 

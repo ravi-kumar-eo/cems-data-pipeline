@@ -14,8 +14,8 @@ One-time setup (same Google Cloud project you use for GEE):
   1. Go to console.cloud.google.com → APIs & Services → Enable APIs
      → search "Google Drive API" → Enable
   2. Go to APIs & Services → Credentials → Create Credentials
-     → OAuth client ID → Desktop app → Download as credentials.json
-  3. Place credentials.json in the repo root (it is gitignored)
+     → OAuth client ID → Desktop app → Download JSON
+  3. Place the downloaded JSON file in Gdrive_credentials/ (any filename is fine)
   First run will open a browser for you to approve Drive read access.
   Token is saved to data/.gdrive_token.json for all subsequent runs.
 
@@ -33,6 +33,19 @@ from pathlib import Path
 # ─── CONFIG ──────────────────────────────────────────────────────────────────
 FOLDER_PREFIX    = "EMSR"          # download Drive root folders starting with this
 PARALLEL_WORKERS = 4               # concurrent file downloads per folder
+
+# Mirrors script 4's rename/merge logic so already-processed files aren't re-downloaded
+LAYER_RENAME = {
+    "S1.tif":         "S1_VV_VH.tif",
+    "S2_indices.tif": "land_cover.tif",
+}
+# Maps tile prefix → merged output filename (script 4 merges and deletes tiles)
+TILED_LAYER_OUT = {
+    "S1":            "S1_VV_VH.tif",
+    "MERIT":         "MERIT.tif",
+    "Precipitation": "Precipitation.tif",
+    "SoilMoisture":  "SoilMoisture.tif",
+}
 # ─────────────────────────────────────────────────────────────────────────────
 
 try:
@@ -53,7 +66,7 @@ BASE_DIR          = Path(__file__).resolve().parent.parent
 DATA_DIR          = BASE_DIR / "data"
 GEE_EXPORTS_DIR   = DATA_DIR / "GEE_exports"
 TOKEN_FILE        = DATA_DIR / ".gdrive_token.json"
-CREDENTIALS_FILE  = BASE_DIR / "credentials.json"
+CREDENTIALS_DIR   = BASE_DIR / "Gdrive_credentials"
 
 
 # ─── AUTHENTICATION ───────────────────────────────────────────────────────────
@@ -72,15 +85,18 @@ def get_drive_service():
         if creds and creds.expired and creds.refresh_token:
             creds.refresh(Request())
         else:
-            if not CREDENTIALS_FILE.exists():
-                print(f"ERROR: credentials.json not found at {CREDENTIALS_FILE}")
+            # Find any JSON file in Gdrive_credentials/
+            json_files = list(CREDENTIALS_DIR.glob("*.json")) if CREDENTIALS_DIR.exists() else []
+            if not json_files:
+                print(f"ERROR: No credentials JSON found in {CREDENTIALS_DIR}")
                 print()
                 print("One-time setup:")
                 print("  1. Go to console.cloud.google.com → APIs & Services → Credentials")
                 print("  2. Create OAuth client ID → Desktop app → Download JSON")
-                print("  3. Save it as credentials.json in the repo root")
+                print(f"  3. Place the downloaded JSON file in {CREDENTIALS_DIR}/")
                 sys.exit(1)
-            flow = InstalledAppFlow.from_client_secrets_file(CREDENTIALS_FILE, SCOPES)
+            credentials_file = json_files[0]
+            flow = InstalledAppFlow.from_client_secrets_file(credentials_file, SCOPES)
             creds = flow.run_local_server(port=0)
 
         DATA_DIR.mkdir(parents=True, exist_ok=True)
@@ -159,15 +175,34 @@ def download_file(service, file_id: str, dest_path: Path) -> bool:
 
 # ─── MAIN LOGIC ──────────────────────────────────────────────────────────────
 
+def is_already_available(local_dir: Path, fname: str) -> bool:
+    """Check if a Drive file is already present, including post-script-4 canonical forms."""
+    if (local_dir / fname).exists():
+        return True
+    canonical = LAYER_RENAME.get(fname)
+    if canonical and (local_dir / canonical).exists():
+        return True
+    for prefix, out_name in TILED_LAYER_OUT.items():
+        if fname.startswith(f"{prefix}-"):
+            return (local_dir / out_name).exists()
+    return False
+
+
 def download_folder(service, folder_id: str, folder_name: str,
                     dry_run: bool, force: bool) -> tuple:
     """
     Download all files from one Drive activation folder into
-    data/GEE_exports/{folder_name}/.
+    data/GEE_exports/{EMSR_code}/{folder_name}/.
+
+    GEE's fileNamePrefix uses a slash (e.g. "EMSR865_.../S1.tif"), which Drive
+    stores as part of the filename.  We strip to the basename so files land flat
+    in local_dir rather than in a nested subfolder.
 
     Returns (downloaded, skipped, failed) counts.
     """
-    local_dir = GEE_EXPORTS_DIR / folder_name
+    from pathlib import PurePosixPath
+    emsr_code = folder_name.split("_")[0]
+    local_dir = GEE_EXPORTS_DIR / emsr_code / folder_name
     drive_files = list_files_in_folder(service, folder_id)
 
     if not drive_files:
@@ -177,10 +212,11 @@ def download_folder(service, folder_id: str, folder_name: str,
     downloaded = skipped = failed = 0
 
     for f in drive_files:
-        fname = f["name"]
-        dest  = local_dir / fname
+        # Drive fname may be "EMSR865_.../S1.tif" — use basename only
+        fname     = PurePosixPath(f["name"]).name
+        dest      = local_dir / fname
 
-        if dest.exists() and not force:
+        if not force and is_already_available(local_dir, fname):
             skipped += 1
             continue
 
@@ -252,7 +288,7 @@ def main():
         total_fail += fail
 
         if skip and not args.force:
-            print(f"    {skip} file(s) already exist — skipped (use --force to re-download)")
+            print(f"    {skip} file(s) already exist — skipped")
 
     print()
     print("=" * 72)

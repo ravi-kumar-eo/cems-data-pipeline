@@ -1,27 +1,26 @@
 #!/usr/bin/env python3
 """
-Script 4: GEE Output Preprocessing
+Script 4: GEE Output Preprocessing — metadata builder
 
-For each completed GEE export activation:
-  1. Rasterizes the CEMS flood extent shapefile (DCC flood_extent/event.shp)
-     to flood_mask.tif aligned to the S1_VV_VH.tif grid (same CRS, resolution, extent).
-  2. Validates all required layers (band counts, file integrity).
-  3. Assigns HydroBASINS level-12 basin ID and region from AOI centroid.
-  4. Merges sensor metadata from activations.csv and writes dataset_metadata.csv.
+This step builds the dataset catalog. An event missing a CORE layer is
+incomplete and is left out of the catalog; it is recorded in the missing-layers
+report instead. Missing only a custom (user-added) layer is tolerated: the event
+stays in the catalog and the absent custom layer is still noted in the report.
+
+For each completed GEE export event:
+  1. Reorganizes the export folder (flatten, merge GEE tiles, canonical names).
+  2. Rasterizes the CEMS flood extent shapefile (flood_extent/event.shp)
+     to flood_mask.tif aligned to the S1_VV_VH.tif grid (or any reference layer).
+  3. Assigns HydroBASINS basin ID and region from the AOI centroid.
+  4. Merges sensor metadata and writes the dataset catalog.
+
+The set of layers checked comes from config.py (enabled layers only), so a
+subset config or a custom temporal length never produces a "failed" event.
 
 Output files:
-  data/GEE_exports/{folder}/flood_mask.tif   binary flood mask per activation (1=flooded)
-  metadata/dataset_metadata.csv              final dataset catalog
-
-Required layers per activation (post-run):
-  S1_VV_VH.tif        2 bands
-  land_cover.tif      2 bands
-  MERIT.tif           4 bands
-  Soil.tif            2 bands
-  ESA_PW.tif          1 band
-  Precipitation.tif  10 bands
-  SoilMoisture.tif   10 bands
-  flood_mask.tif       1 band
+  data/GEE_exports/{folder}/flood_mask.tif   binary flood mask per event (1=flooded)
+  metadata/4_dataset_metadata.csv            final catalog (one row per cataloged event)
+  metadata/4_missing_layers_report.csv       per event, which enabled layers are absent
 
 Usage:
   python scripts/4_gee_output_preprocessing.py
@@ -39,6 +38,7 @@ import numpy as np
 try:
     import rasterio
     from rasterio.features import rasterize as rio_rasterize
+    from rasterio.merge import merge as rio_merge
 except ImportError:
     print("ERROR: rasterio not found. Install with: pip install rasterio")
     sys.exit(1)
@@ -65,27 +65,150 @@ except ImportError:
 
 # ─── PATH SETUP ──────────────────────────────────────────────────────────────
 
-BASE_DIR             = Path(__file__).resolve().parent.parent
-DATA_DIR             = BASE_DIR / "data"
-META_DIR             = BASE_DIR / "metadata"
-GEE_EXPORTS_DIR      = DATA_DIR / "GEE_exports"
-DCC_ACTIVATIONS_DIR  = DATA_DIR / "activations" / "activations_dcc"
-ACTIVATIONS_CSV      = META_DIR / "activations.csv"
-GEE_TASKS_CSV        = META_DIR / "gee_tasks_record.csv"
-DATASET_METADATA_CSV = META_DIR / "dataset_metadata.csv"
-HYDROBASINS_DIR      = DATA_DIR / "hydrobasins"
+import config
+from config import enabled_layers
+from add_gee_layers import core_keys
 
-# Required layers with expected band counts
-REQUIRED_LAYERS = {
-    "S1_VV_VH": {"files": ["S1_VV_VH.tif"], "bands": 2},
-    "land_cover": {"files": ["land_cover.tif"], "bands": 2},
-    "MERIT": {"files": ["MERIT.tif"], "bands": 4},
-    "Soil": {"files": ["Soil.tif"], "bands": 2},
-    "ESA_PW": {"files": ["ESA_PW.tif", "ESA_WorldCover_PermanentWater.tif"], "bands": 1},
-    "Precipitation": {"files": ["Precipitation.tif"], "bands": 10},
-    "SoilMoisture": {"files": ["SoilMoisture.tif"], "bands": 10},
-    "flood_mask": {"files": ["flood_mask.tif"], "bands": 1},
+BASE_DIR             = config.BASE_DIR
+DATA_DIR             = config.DATA_DIR
+META_DIR             = config.META_DIR
+GEE_EXPORTS_DIR      = config.GEE_EXPORTS_DIR
+DCC_ACTIVATIONS_DIR  = config.DCC_ACTIVATIONS_DIR
+ACTIVATIONS_CSV      = config.CSV_ACTIVATION_CATALOG
+GEE_TASKS_CSV        = config.CSV_GEE_EXPORT_STATUS
+DATASET_METADATA_CSV = config.CSV_DATASET_METADATA
+COMPLETE_METADATA_CSV = config.CSV_COMPLETE_METADATA
+MISSING_LAYERS_CSV   = config.CSV_MISSING_LAYERS
+HYDROBASINS_DIR      = config.HYDROBASINS_DIR
+
+# Layer file → expected band count, derived from the ENABLED registry. Used only
+# to REPORT missing layers, never to drop an activation. flood_mask is added
+# because Script 4 produces it locally (it is not a GEE export).
+def _expected_layers():
+    layers = {spec.key: {"file": spec.filename, "bands": spec.band_count()}
+              for spec in enabled_layers()}
+    layers["flood_mask"] = {"file": "flood_mask.tif", "bands": 1}
+    return layers
+
+# Legacy GEE export name → canonical filename (kept for older exports on disk).
+LAYER_RENAME = {
+    "S1.tif":         "S1_VV_VH.tif",
+    "S2_indices.tif": "S2_NDVI_NDBI.tif",
+    "land_cover.tif": "S2_NDVI_NDBI.tif",
+    "ESA_PW.tif":     "ESA_WorldCover_PermanentWater.tif",
 }
+
+
+# ─── EXPORT REORGANIZATION ───────────────────────────────────────────────────
+
+def reorganize_export(export_root: Path) -> bool:
+    """
+    Bring a downloaded GEE export folder into the canonical flat structure:
+
+      data/GEE_exports/{folder_name}/
+        S1_VV_VH.tif        2 bands
+        land_cover.tif      2 bands
+        MERIT.tif           4 bands
+        Soil.tif            2 bands
+        ESA_WorldCover_PermanentWater.tif  1 band  permanent water (ESA WorldCover)
+        Precipitation.tif  10 bands
+        SoilMoisture.tif   10 bands
+
+    Three things are handled:
+      1. Flatten nested subfolder — GEE toDrive() with a slash in fileNamePrefix
+         creates a subfolder inside the Drive folder; script 3 preserves that,
+         so files land at export_root/{folder_name}/ instead of export_root/.
+      2. Merge spatial tiles — when an export exceeds GEE's per-file limit it is
+         split into tiles named {Layer}-XXXXXXXXXX-XXXXXXXXXX.tif.  Any number of
+         tiles is supported; they are mosaicked and the originals deleted.
+      3. Rename to canonical names (S1.tif → S1_VV_VH.tif, S2_indices.tif → land_cover.tif).
+
+    Idempotent: already-reorganized folders are skipped at each sub-step.
+    Returns True if the folder looks complete after reorganization.
+    """
+    # ── Step 1: flatten nested subfolder ─────────────────────────────────────
+    for sub in list(export_root.iterdir()):
+        if not sub.is_dir():
+            continue
+        tifs = list(sub.glob("*.tif"))
+        if not tifs:
+            continue
+        for f in list(sub.iterdir()):
+            dest = export_root / f.name
+            if not dest.exists():
+                f.rename(dest)
+        # remove subfolder only if now empty
+        remaining = list(sub.iterdir())
+        if not remaining:
+            sub.rmdir()
+
+    # ── Step 2: merge spatial tiles → canonical single files ─────────────────
+    # For each enabled layer, find its tiles "{stem}-XXXX-YYYY.tif" and mosaic
+    # them. Temporal layers are date-stamped (Precipitation_YYYYMMDD_YYYYMMDD),
+    # so their stem is discovered from disk and the merged file keeps that name.
+    merge_specs = []  # (tile_prefix, out_name)
+    for spec in enabled_layers():
+        stem = spec.filename[:-4]
+        if spec.kind == "temporal":
+            # Discover the dated stem(s) present (one per temporal layer per event).
+            dated = {t.name.split("-")[0] for t in export_root.glob(f"{stem}_*-*.tif")}
+            dated |= {p.stem for p in export_root.glob(f"{stem}_*.tif") if "-" not in p.stem}
+            for d in sorted(dated):
+                merge_specs.append((d, f"{d}.tif"))
+        else:
+            merge_specs.append((stem, spec.filename))
+
+    for prefix, out_name in merge_specs:
+        out_path = export_root / out_name
+        tiles    = sorted(export_root.glob(f"{prefix}-*.tif"))
+
+        if not tiles:
+            continue  # no tiles; single file or already merged
+
+        if out_path.exists():
+            # merged file already present — just clean up leftover tiles
+            for t in tiles:
+                t.unlink(missing_ok=True)
+            continue
+
+        # Validate tiles (skip 0-byte/corrupt files — they were incomplete downloads)
+        valid_tiles = [t for t in tiles if t.stat().st_size > 0]
+        if not valid_tiles:
+            print(f"    ! all tiles for {prefix} are 0-byte — re-run script 3 to re-download")
+            continue
+        if len(valid_tiles) < len(tiles):
+            bad = [t.name for t in tiles if t.stat().st_size == 0]
+            print(f"    ! skipping corrupt (0-byte) tiles for {prefix}: {bad}")
+            print(f"      Delete them and re-run script 3, then script 4 again")
+            continue
+
+        try:
+            datasets = [rasterio.open(t) for t in valid_tiles]
+            mosaic, transform = rio_merge(datasets)
+            profile = datasets[0].profile.copy()
+            profile.update(height=mosaic.shape[1], width=mosaic.shape[2],
+                           transform=transform)
+            with rasterio.open(out_path, "w", **profile) as dst:
+                dst.write(mosaic)
+            for ds in datasets:
+                ds.close()
+            for t in valid_tiles:
+                t.unlink(missing_ok=True)
+            print(f"    merged {len(valid_tiles)} {prefix} tiles → {out_path.name}")
+        except Exception as e:
+            print(f"    ! tile merge failed for {prefix}: {e}")
+
+    # ── Step 3: rename to canonical filenames ─────────────────────────────────
+    for old_name, new_name in LAYER_RENAME.items():
+        src = export_root / old_name
+        dst = export_root / new_name
+        if src.exists():
+            if not dst.exists():
+                src.rename(dst)
+            else:
+                src.unlink()  # dst already produced by tile merge; drop the duplicate
+
+    return True
 
 
 # ─── RESOLUTION MAPPING ──────────────────────────────────────────────────────
@@ -176,48 +299,32 @@ def is_valid_tif(file_path: Path, expected_bands: int) -> bool:
         return False
 
 
-def validate_layer(folder: Path, layer_name: str, layer_spec: Dict) -> bool:
+def _resolve_layer_file(folder: Path, fname: str) -> Optional[Path]:
     """
-    Validate that a layer exists and has correct band count.
-
-    Args:
-        folder: Activation folder path
-        layer_name: Layer name (e.g., "S1_VV_VH")
-        layer_spec: Dict with "files" (list of possible filenames) and "bands" (expected count)
-
-    Returns:
-        True if valid layer found, False otherwise
+    Locate a layer file in an event folder. Temporal layers are date-stamped
+    (e.g. Precipitation_YYYYMMDD_YYYYMMDD.tif), so they are matched by glob on
+    the filename stem; everything else is an exact name.
     """
-    expected_bands = layer_spec["bands"]
-    possible_files = layer_spec["files"]
-
-    for filename in possible_files:
-        file_path = folder / filename
-        if is_valid_tif(file_path, expected_bands):
-            return True
-
-    return False
+    stem = fname[:-4]
+    if stem in ("Precipitation", "SoilMoisture"):
+        hits = sorted(folder.glob(f"{stem}_*.tif"))
+        return hits[0] if hits else None
+    p = folder / fname
+    return p if p.exists() else None
 
 
-def validate_activation(folder: Path) -> Tuple[bool, Dict[str, bool], List[str]]:
+def missing_layers_for(folder: Path) -> List[str]:
     """
-    Validate all layers for one activation folder.
-
-    Returns:
-        Tuple of (is_complete, layer_status_dict, missing_layers_list)
+    Return the list of ENABLED layers absent (or wrong band count) for one
+    event folder. The caller decides gating: an absent CORE layer excludes the
+    event from the catalog, an absent custom layer does not.
     """
-    layer_status = {}
-    missing_layers = []
-
-    for layer_name, layer_spec in REQUIRED_LAYERS.items():
-        is_valid = validate_layer(folder, layer_name, layer_spec)
-        layer_status[layer_name] = is_valid
-        if not is_valid:
-            missing_layers.append(layer_name)
-
-    is_complete = len(missing_layers) == 0
-
-    return is_complete, layer_status, missing_layers
+    missing = []
+    for key, spec in _expected_layers().items():
+        path = _resolve_layer_file(folder, spec["file"])
+        if path is None or not is_valid_tif(path, spec["bands"]):
+            missing.append(key)
+    return missing
 
 
 # ─── HYDROBASINS FUNCTIONS ───────────────────────────────────────────────────
@@ -302,7 +409,9 @@ def download_hydrobasins_level12():
 
 def get_basin_id(aoi_shp_path: Path, basins_gdf: gpd.GeoDataFrame) -> Optional[str]:
     """
-    Get HydroBASINS level 12 basin ID for an activation based on AOI centroid.
+    Get the HydroBASINS Pfafstetter Level-5 basin code for an activation, based on
+    the AOI centroid. The Level-5 code is the first 5 digits of the PFAF_ID of the
+    Level-12 basin the centroid falls in.
 
     Strategy:
     1. Try 'within' query first (centroid inside basin)
@@ -310,11 +419,14 @@ def get_basin_id(aoi_shp_path: Path, basins_gdf: gpd.GeoDataFrame) -> Optional[s
 
     Args:
         aoi_shp_path: Path to AOI shapefile
-        basins_gdf: GeoDataFrame of HydroBASINS level 12
+        basins_gdf: GeoDataFrame of HydroBASINS level 12 (must include PFAF_ID)
 
     Returns:
-        Basin ID (HYBAS_ID) as string, or None if not found
+        Level-5 Pfafstetter code as string (e.g. "23218"), or None if not found
     """
+    def _l5(pfaf_id) -> str:
+        return str(int(pfaf_id))[:5]
+
     try:
         # Read AOI shapefile
         aoi_gdf = gpd.read_file(aoi_shp_path)
@@ -333,9 +445,8 @@ def get_basin_id(aoi_shp_path: Path, basins_gdf: gpd.GeoDataFrame) -> Optional[s
         point_gdf = gpd.GeoDataFrame({'geometry': [centroid]}, crs='EPSG:4326')
         joined = gpd.sjoin(point_gdf, basins_gdf, how='left', predicate='within')
 
-        if len(joined) > 0 and 'HYBAS_ID' in joined.columns and not pd.isna(joined.iloc[0]['HYBAS_ID']):
-            basin_id = joined.iloc[0]['HYBAS_ID']
-            return str(int(basin_id))
+        if len(joined) > 0 and 'PFAF_ID' in joined.columns and not pd.isna(joined.iloc[0]['PFAF_ID']):
+            return _l5(joined.iloc[0]['PFAF_ID'])
 
         # Try 2: Find nearest basin (for coastal/ocean areas)
         basins_gdf['distance'] = basins_gdf.geometry.distance(centroid)
@@ -343,8 +454,7 @@ def get_basin_id(aoi_shp_path: Path, basins_gdf: gpd.GeoDataFrame) -> Optional[s
 
         # Only use nearest if it's reasonably close (within ~50km = ~0.5 degrees)
         if basins_gdf.loc[nearest_idx, 'distance'] < 0.5:
-            basin_id = basins_gdf.loc[nearest_idx, 'HYBAS_ID']
-            return str(int(basin_id))
+            return _l5(basins_gdf.loc[nearest_idx, 'PFAF_ID'])
 
         return None
 
@@ -358,6 +468,7 @@ def rasterize_flood_mask(export_folder: Path, dcc_folder: Path) -> bool:
     """
     Rasterize flood_extent/event.shp to flood_mask.tif aligned to S1_VV_VH.tif.
     Binary output: 1 = flooded, 0 = not flooded. Skips if already exists.
+    Assumes reorganize_export() has already been called on export_folder.
     Returns True on success or if already exists, False on failure.
     """
     out_tif   = export_folder / "flood_mask.tif"
@@ -420,8 +531,9 @@ def rasterize_flood_mask(export_folder: Path, dcc_folder: Path) -> bool:
 # ─── MAIN ────────────────────────────────────────────────────────────────────
 
 def find_activation_in_exports(folder_name: str) -> Optional[Path]:
-    """Return path to GEE_exports/{folder_name}/ or None if not found."""
-    p = GEE_EXPORTS_DIR / folder_name
+    """Return path to GEE_exports/{EMSR_code}/{folder_name}/ or None if not found."""
+    emsr_code = folder_name.split("_")[0]
+    p = GEE_EXPORTS_DIR / emsr_code / folder_name
     return p if p.exists() else None
 
 
@@ -433,8 +545,10 @@ def main():
     print(f"  GEE_TASKS_CSV   : {GEE_TASKS_CSV}")
     print("=" * 72)
 
+    config.migrate_csv_names()  # rename any old-named metadata files in place
+
     if not GEE_TASKS_CSV.exists():
-        print(f"\n! gee_tasks_record.csv not found: {GEE_TASKS_CSV}")
+        print(f"\n! {GEE_TASKS_CSV.name} not found: {GEE_TASKS_CSV}")
         print("  Run Script 2 first (--update-tracking) to generate it.")
         sys.exit(1)
 
@@ -445,8 +559,19 @@ def main():
 
     META_DIR.mkdir(parents=True, exist_ok=True)
 
+    # ── Step 1: Reorganize all export folders into canonical flat structure ────
+    print("\n[1/6] Reorganizing GEE export folders (flatten + merge tiles + rename)...")
+    # Structure: GEE_exports/{EMSR_code}/{activation_folder}/
+    all_export_dirs = sorted(
+        act for emsr_dir in GEE_EXPORTS_DIR.iterdir() if emsr_dir.is_dir()
+        for act in emsr_dir.iterdir() if act.is_dir()
+    )
+    for export_root in all_export_dirs:
+        reorganize_export(export_root)
+    print(f"  Done ({len(all_export_dirs)} folders)")
+
     # Load HydroBASINS
-    print("\n[1/5] Loading HydroBASINS level 12 data...")
+    print("\n[2/6] Loading HydroBASINS level-12 data...")
     try:
         basins_file = download_hydrobasins_level12()
         if basins_file is None:
@@ -460,7 +585,7 @@ def main():
         basins_gdf = None
 
     # Load gee_tasks_record.csv
-    print("\n[2/5] Loading gee_tasks_record.csv...")
+    print("\n[3/6] Loading gee_tasks_record.csv...")
     try:
         tracking_df = pd.read_csv(GEE_TASKS_CSV)
         print(f"  ✓ Loaded {len(tracking_df)} activations")
@@ -469,7 +594,7 @@ def main():
         sys.exit(1)
 
     # Load activations.csv (sensor info from Script 1)
-    print("\n[3/5] Loading activations.csv (sensor info)...")
+    print("\n[4/6] Loading activations.csv (sensor info)...")
     sensor_lookup: Dict[str, Dict] = {}
     if ACTIVATIONS_CSV.exists():
         try:
@@ -485,12 +610,12 @@ def main():
     else:
         print(f"  ! activations.csv not found at {ACTIVATIONS_CSV} -- sensor columns will be empty")
 
-    # Rasterize flood masks from DCC shapefiles
-    print("\n[4/5] Rasterizing flood masks from CEMS shapefiles...")
+    # Rasterize flood masks
+    print("\n[5/6] Rasterizing flood masks from CEMS shapefiles...")
     mask_ok = mask_fail = mask_skip = 0
     for row in tracking_df.itertuples():
-        folder_name = row.folder_name
-        emsr_code   = folder_name.split("_")[0]
+        folder_name   = row.folder_name
+        emsr_code     = folder_name.split("_")[0]
         export_folder = find_activation_in_exports(folder_name)
         if export_folder is None:
             continue
@@ -504,28 +629,51 @@ def main():
             print(f"  ✓ {folder_name}")
         else:
             mask_fail += 1
-            print(f"  ✗ {folder_name} -- no flood_extent/event.shp or S1 reference missing")
+            print(f"  ✗ {folder_name} -- missing flood_extent/event.shp or S1_VV_VH.tif")
     print(f"  Done: {mask_ok} rasterized, {mask_skip} already existed, {mask_fail} failed")
 
-    # Validate GEE exports
-    print("\n[5/5] Validating GEE exports...")
-    complete_records = []
+    # Build the catalog. An event missing a CORE layer is incomplete: it is
+    # written to the missing-layers report and left out of the catalog. Missing
+    # only a custom (user-added) layer is tolerated, so the event stays in the
+    # catalog and the absent custom layer is still recorded in the report.
+    print("\n[6/6] Building catalog + missing-layers report...")
+    catalog_records = []
+    missing_records = []
     total = len(tracking_df)
     complete_count = 0
+    gated_count = 0
+    CORE_KEYS = set(core_keys())
 
     for idx, row in tracking_df.iterrows():
         folder_name = row['folder_name']
         emsr_code   = folder_name.split("_")[0]
 
         export_folder = find_activation_in_exports(folder_name)
+
+        # Enabled layers absent for this event.
         if export_folder is None:
-            continue
+            missing = list(_expected_layers().keys())  # nothing downloaded yet
+        else:
+            missing = missing_layers_for(export_folder)
+        core_missing = [k for k in missing if k in CORE_KEYS]
 
-        is_complete, _, _ = validate_activation(export_folder)
-        if not is_complete:
-            continue
+        if not missing:
+            complete_count += 1
+        else:
+            missing_records.append({
+                'folder_name': folder_name,
+                'n_missing': len(missing),
+                'missing_layers': ','.join(missing),
+                'core_missing': ','.join(core_missing),
+            })
 
-        complete_count += 1
+        # Gate on core layers: an event missing any core layer is excluded from
+        # the catalog (it lives in the missing-layers report instead).
+        if core_missing:
+            gated_count += 1
+            if (idx + 1) % 100 == 0:
+                print(f"  Processed {idx + 1}/{total} events...")
+            continue
 
         # Detect region from AOI shapefile
         aoi_shp = DCC_ACTIVATIONS_DIR / emsr_code / folder_name / "aoi" / "aoi.shp"
@@ -543,7 +691,7 @@ def main():
         post_sensors = sensors.get('post_event_sensors', '')
         res_m = get_post_sensor_resolution(post_sensors)
 
-        complete_records.append({
+        catalog_records.append({
             'folder_name': folder_name,
             'region': region,
             'basin_id': basin_id,
@@ -556,27 +704,68 @@ def main():
         if (idx + 1) % 100 == 0:
             print(f"  Processed {idx + 1}/{total} activations...")
 
-    # Write dataset_metadata.csv
     fieldnames = [
         'folder_name', 'region', 'basin_id',
         'pre_event_sensor', 'post_event_sensors',
         'resolution_post_sensor', 'resolution_class',
     ]
+
+    # The complete catalog is the accumulated record of every event ever
+    # cataloged. Diff this run against it: an event whose folder_name is not yet
+    # in the complete catalog is new and goes to 4_dataset_metadata.csv; the
+    # complete catalog is then refreshed to old rows plus this run's events.
     DATASET_METADATA_CSV.parent.mkdir(parents=True, exist_ok=True)
+    existing = {}
+    if COMPLETE_METADATA_CSV.exists():
+        with open(COMPLETE_METADATA_CSV, newline='', encoding='utf-8') as f:
+            for row in csv.DictReader(f):
+                existing[row['folder_name']] = row
+
+    new_records = [r for r in catalog_records if r['folder_name'] not in existing]
+
+    # New events from this run.
     with open(DATASET_METADATA_CSV, 'w', newline='', encoding='utf-8') as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames)
         writer.writeheader()
-        writer.writerows(complete_records)
+        writer.writerows(new_records)
+
+    # Full accumulated catalog: prior rows are settled and never modified (this
+    # preserves any 'split' Step 5 wrote). Only genuinely new events are added.
+    merged = dict(existing)
+    for r in new_records:
+        merged[r['folder_name']] = r
+    # Prior rows may carry extra columns (e.g. a 'split' added by Step 5); keep
+    # them by extending the header with any field beyond the base set.
+    extra = [k for k in next(iter(merged.values()), {}) if k not in fieldnames]
+    complete_fields = fieldnames + extra
+    with open(COMPLETE_METADATA_CSV, 'w', newline='', encoding='utf-8') as f:
+        writer = csv.DictWriter(f, fieldnames=complete_fields, extrasaction='ignore')
+        writer.writeheader()
+        for row in merged.values():
+            writer.writerow({k: row.get(k, '') for k in complete_fields})
+
+    # Write the missing-layers report (only events with absences).
+    with open(MISSING_LAYERS_CSV, 'w', newline='', encoding='utf-8') as f:
+        writer = csv.DictWriter(
+            f, fieldnames=['folder_name', 'n_missing', 'missing_layers', 'core_missing'])
+        writer.writeheader()
+        writer.writerows(missing_records)
 
     print()
     print("=" * 72)
     print("  SUMMARY")
     print("=" * 72)
-    print(f"  Activations in tracking CSV  : {total}")
+    print(f"  Events cataloged this run    : {len(catalog_records)}")
+    print(f"  New this run                 : {len(new_records)}")
+    print(f"  Complete catalog total       : {len(merged)}")
     print(f"  Flood masks rasterized       : {mask_ok}  (skipped: {mask_skip}, failed: {mask_fail})")
-    print(f"  Complete (all layers valid)  : {complete_count}")
+    print(f"  Complete (all enabled layers): {complete_count}")
+    print(f"  With missing layers          : {len(missing_records)}")
+    print(f"  Excluded (missing core layer): {gated_count}")
     print()
-    print(f"  dataset_metadata.csv -> {DATASET_METADATA_CSV}")
+    print(f"  new this run  -> {DATASET_METADATA_CSV}")
+    print(f"  full catalog  -> {COMPLETE_METADATA_CSV}")
+    print(f"  missing report-> {MISSING_LAYERS_CSV}")
     print("=" * 72)
 
 

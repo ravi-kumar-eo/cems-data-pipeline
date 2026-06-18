@@ -2,18 +2,22 @@
 
 A pipeline to build a multi-resolution flood dataset from Copernicus EMSR rapid mapping activations and EO data from GEE. Covers the full workflow from raw CEMS product download and DCC conversion to GEE export submission, Drive retrieval, and final dataset preprocessing. Each processed activation produces 8 analysis-ready GeoTIFFs at mixed resolutions (10 m to 9 km), including a binary flood mask rasterized from the official CEMS delineation, aligned to a common grid.
 
-**Per-activation GeoTIFF exports (7 files per event):**
+**Per-activation GeoTIFF outputs (8 files per event: 7 GEE layers + flood mask):**
 
 | File | Bands | Source | GEE Collection |
 |---|---|---|---|
 | `flood_mask.tif` | 1 (binary: 1=flooded) | Copernicus CEMS flood extent shapefile, 10 m | rasterized from DCC `flood_extent/event.shp` |
 | `S1_VV_VH.tif` | 2 (VV, VH) | Sentinel-1 SAR GRD, 10 m | `COPERNICUS/S1_GRD` |
-| `land_cover.tif` | 2 (NDVI, NDBI) | Sentinel-2 SR, 10 m | `COPERNICUS/S2_SR_HARMONIZED` |
+| `S2_NDVI_NDBI.tif` | 2 (NDVI, NDBI) | Sentinel-2 SR, 10 m | `COPERNICUS/S2_SR_HARMONIZED` |
 | `MERIT.tif` | 4 (elevation, flow dir, UDA, HAND) | MERIT Hydro, 90 m | `MERIT/Hydro/v1_0_1` |
 | `Soil.tif` | 2 (clay, sand) | OpenLandMap SoilGrids, 250 m | `OpenLandMap/SOL/...` |
-| `ESA_PW.tif` | 1 (permanent water mask) | ESA WorldCover, 10 m | `ESA/WorldCover/v200` |
-| `Precipitation.tif` | 10 (daily, 10 days pre-event) | ERA5-Land daily, 9 km | `ECMWF/ERA5_LAND/DAILY_AGGR` |
-| `SoilMoisture.tif` | 10 (daily, 10 days pre-event) | SMAP L4 surface SM, 9 km | `NASA/SMAP/SPL4SMGP/007` |
+| `ESA_WorldCover_PermanentWater.tif` | 1 (permanent water mask) | ESA WorldCover, 10 m | `ESA/WorldCover/v200` |
+| `Precipitation_{first}_{last}.tif` | N (daily, N days pre-event) | GPM-IMERG V07 daily, ~11 km | `NASA/GPM_L3/IMERG_V07` |
+| `SoilMoisture_{first}_{last}.tif` | N (daily, N days pre-event) | SMAP L4 surface SM, ~9 km | `NASA/SMAP/SPL4SMGP/008` |
+
+The seven geospatial layers above are configurable in `scripts/config.py` (`LAYER_TOGGLES` to enable/disable each layer, `N_DAYS_OVERRIDE` to set the daily-series length N per temporal layer, default 30). New GEE layers can be added by copying a template in `scripts/add_gee_layers.py`. `flood_mask.tif` (the rasterized CEMS delineation) is produced in Step 4; the permanent-water layer (`ESA_WorldCover_PermanentWater.tif`, ESA WorldCover) is exported directly from GEE. That gives 8 GeoTIFFs per activation. The temporal layers are written with their antecedent window stamped into the filename, e.g. `Precipitation_20240714_20240812.tif`.
+
+Only two CEMS vector components are used per activation: the AOI boundary (`aoi/aoi.shp`) and the flood extent (`flood_extent/event.shp`). CEMS stopped shipping pre-event hydrography in 2023, so permanent water is taken from ESA WorldCover alone, which is available for every event.
 
 ---
 
@@ -31,23 +35,28 @@ earthengine authenticate
 ```
 
 **Google Drive authentication (once):**  
-Enable the Drive API and download `credentials.json`:
-1. [console.cloud.google.com](https://console.cloud.google.com) → APIs & Services → Enable APIs → search **Google Drive API** → Enable
-2. APIs & Services → Credentials → Create Credentials → OAuth client ID → Desktop app → Download JSON
-3. Rename to `credentials.json` and place it in this repo root
+Two one-time steps, both per Google Cloud project:
 
-First run of Script 3 will open a browser for OAuth approval.
+1. **Enable the Drive API:** [console.cloud.google.com](https://console.cloud.google.com) → APIs & Services → Enable APIs → search **Google Drive API** → Enable  
+   *(Even with credentials.json in place, the API must be explicitly enabled in the project — this is separate from credentials)*
+2. **Download OAuth credentials:** APIs & Services → Credentials → Create Credentials → OAuth client ID → Desktop app → Download JSON → place in `Gdrive_credentials/` (any filename is fine)
+
+First run of Script 3 will open a browser for OAuth approval. The token is saved to `data/.gdrive_token.json` — no browser prompt on subsequent runs.
 
 ---
 
 ## Pipeline
 
 ```
+config.py                        Edit first: enable/disable layers, set daily-series length
+add_gee_layers.py                Layer registry — copy a template here to add a custom GEE layer
 1_download_activations.py        Download EMSR flood activations from Copernicus + convert to DCC format
-2_submit_gee_tasks.py            Submit GEE export tasks to Google Drive (7 layers per activation)
+2_submit_gee_tasks.py            Submit GEE export tasks to Google Drive (enabled layers per activation)
                                  # wait for GEE tasks to complete (hours)
 3_download_gee_exports.py        Download all EMSR* folders from Google Drive to data/GEE_exports/
-4_gee_output_preprocessing.py    Rasterize flood masks + validate exports + build dataset_metadata.csv
+4_gee_output_preprocessing.py    Rasterize flood masks + permanent water + build catalog
+5_create_splits.py               Assign storm/basin-exclusive train/val/test split
+6_make_patches.py                Cut events into model-ready 2.56 km patch tiles
 ```
 
 ```bash
@@ -57,6 +66,8 @@ python scripts/2_submit_gee_tasks.py
 # wait for GEE tasks at code.earthengine.google.com/tasks
 python scripts/3_download_gee_exports.py
 python scripts/4_gee_output_preprocessing.py
+python scripts/5_create_splits.py
+python scripts/6_make_patches.py
 ```
 
 ---
@@ -67,21 +78,33 @@ python scripts/4_gee_output_preprocessing.py
 data/
   activations/
     activations_raw/          raw Copernicus downloads
-    activations_dcc/          converted DCC format (aoi/, flood_extent/, permanent_water/)
+    activations_dcc/          converted DCC format (aoi/, flood_extent/)
   GEE_exports/
-    {folder_name}/            one folder per activation
-      S1_VV_VH.tif            2 bands  Sentinel-1 VV/VH
-      land_cover.tif          2 bands  NDVI + NDBI
-      MERIT.tif               4 bands  elevation, flow direction, UDA, HAND
-      Soil.tif                2 bands  clay + sand (SoilGrids)
-      ESA_PW.tif              1 band   permanent water mask
-      Precipitation.tif      10 bands  ERA5-Land daily (10 days pre-event)
-      SoilMoisture.tif       10 bands  SMAP daily (10 days pre-event)
-metadata/
-  activations.csv             activation catalog (Script 1)
-  activations_status.csv      per-product download + DCC status (Script 1)
-  gee_tasks_record.csv        GEE task tracking (Script 2)
-  dataset_metadata.csv           final dataset catalog (Script 4)
+    {EMSR}/{folder_name}/     one folder per activation
+      S1_VV_VH.tif                       2 bands  Sentinel-1 VV/VH
+      S2_NDVI_NDBI.tif                   2 bands  NDVI + NDBI
+      MERIT.tif                          4 bands  elevation, flow direction, UDA, HAND
+      Soil.tif                           2 bands  clay + sand (SoilGrids)
+      ESA_WorldCover_PermanentWater.tif  1 band   permanent water mask (ESA WorldCover)
+      Precipitation_{first}_{last}.tif   N bands  GPM-IMERG daily (N days pre-event)
+      SoilMoisture_{first}_{last}.tif    N bands  SMAP daily (N days pre-event)
+      flood_mask.tif                     1 band   rasterized CEMS flood extent
+  patches/
+    {EMSR}/{folder_name}/     2.56 km tiles, 5 GeoTIFFs per patch
+      patch_NNNN_input_10m.tif      5 bands   256x256  S1 VV, S1 VH, NDVI, NDBI, permanent water
+      patch_NNNN_input_80m.tif      5 bands   32x32    MERIT elev, flowdir sin/cos, UDA, HAND
+      patch_NNNN_input_160m.tif     2 bands   16x16    clay, sand
+      patch_NNNN_input_2560m.tif    2N bands  1x1      precipitation (N) + soil moisture (N)
+      patch_NNNN_flood_mask.tif     1 band    256x256  CEMS flood label
+  metadata/
+    1_activation_catalog.csv        activation catalog (Script 1)
+    1_activation_status.csv         per-product download + DCC status (Script 1)
+    2_gee_export_status.csv         per-layer GEE export status (Script 2)
+    4_dataset_metadata.csv          final dataset catalog (Script 4)
+    4_missing_layers_report.csv     missing enabled layers per activation (Script 4)
+    5_split_info.json               split method, counts, exclusivity checks (Script 5)
+    patch_metadata.csv              one row per patch tile (Script 6)
+    6_patch_validation_issues.csv   per-patch QC findings (Script 6)
 ```
 
 ---
@@ -92,7 +115,7 @@ metadata/
 |---|---|
 | `folder_name` | activation folder name |
 | `region` | europe / rest_of_world |
-| `basin_id` | HydroSHEDS HydroBASINS level 12 ID |
+| `basin_id` | HydroBASINS Pfafstetter Level-5 code |
 | `pre_event_sensor` | sensor used for pre-event image |
 | `post_event_sensors` | sensor(s) used for post-event image |
 | `resolution_post_sensor` | best post-event resolution in metres |
