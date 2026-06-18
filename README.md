@@ -1,22 +1,26 @@
 # CEMS Multi-Resolution Flood Dataset
 
-A multi-modal global flood dataset built from Copernicus EMSR rapid-mapping activations and Earth-observation layers. A Copernicus activation (an EMSRXXX code) is opened for a flood emergency and produces one or more mapped flood events. The dataset is released as patch tiles ready for model training, with a train, validation, and test split already assigned. The scripts that produce the dataset are included, so it can be reproduced or extended to new activations.
+A global dataset for flood mapping. Each sample pairs a stack of Earth-observation and weather layers with the observed flood extent, so a model can learn to predict which pixels are flooded. The labels come from Copernicus Emergency Management Service flood delineations, and the input layers are drawn from satellite imagery, terrain, soil, and pre-event weather.
+
+The dataset is released as image tiles that are ready for model training, with a train, validation, and test split already assigned. The scripts that produce it are included, so it can be reproduced or extended to new flood events.
 
 **Dataset:** [Zenodo DOI to be added]
 
 ## The patch dataset
 
-Each flood event is cut into square, non-overlapping 2.56 km tiles. A tile is five co-registered GeoTIFFs, four input groups at their native resolutions and the flood label. The daily layers cover `N` antecedent days, 30 by default, so the bands below are given in terms of `N`.
+The flood records come from Copernicus activations. An activation (an EMSRXXX code) is opened for a flood emergency and produces one or more mapped flood events. Each event is cut into square, non-overlapping 2.56 km tiles. A tile is five co-registered GeoTIFFs, four input groups at their own resolution and the flood label. The weather layers cover `N` days before the flood, 30 by default, so the bands below are written in terms of `N`.
 
 | File | Bands | Pixels | Contents |
 |---|---|---|---|
 | `patch_NNNN_input_10m.tif` | 5 | 256×256 | S1 VV, S1 VH, NDVI, NDBI, permanent water |
 | `patch_NNNN_input_80m.tif` | 5 | 32×32 | MERIT elevation, flow-dir sin, flow-dir cos, UDA, HAND |
 | `patch_NNNN_input_160m.tif` | 2 | 16×16 | SoilGrids clay %, sand % |
-| `patch_NNNN_input_2560m.tif` | 2N | 1×1 | precipitation (N days) + soil moisture (N days) |
+| `patch_NNNN_input_2560m.tif` | 2N | 5×5 | precipitation (N days) + soil moisture (N days) |
 | `patch_NNNN_flood_mask.tif` | 1 | 256×256 | flood label (1 = flooded) |
 
-With the default of 30 days, `input_2560m` has 60 bands. The flood label is the Copernicus CEMS flood delineation. Permanent water is a separate input band (band 5 of `input_10m`), taken from ESA WorldCover, so a model can separate pre-existing water from new flooding while the label stays the observed inundation. MERIT flow direction is given as the sine and cosine of its compass angle. A patch index, `patch_metadata.csv`, lists every tile with its event, bounds, basin, and split.
+With the default of 30 days, `input_2560m` has 60 bands. The first four files share the 2.56 km tile footprint at their own resolution. The weather layers are coarser than a tile (about 11 km per pixel), so resampling them to the tile would give one repeated value. Instead, `input_2560m` keeps a 5×5 grid of native weather pixels centred on the tile, sampled at 0.1° (about 11 km) spacing, so each tile sees the local spatial pattern of rainfall and soil moisture, not a single number. It is stored in geographic coordinates (EPSG:4326).
+
+The flood label is the Copernicus CEMS flood delineation. Permanent water is a separate input band (band 5 of `input_10m`), taken from ESA WorldCover, so a model can separate pre-existing water from new flooding while the label stays the observed inundation. MERIT flow direction is given as the sine and cosine of its compass angle. A patch index, `patch_metadata.csv`, lists every tile with its event, bounds, basin, and split.
 
 The split is assigned at HydroBASINS Pfafstetter Level 5 and is exclusive by basin and by activation, so no basin and no activation appears in more than one of the train, validation, and test sets.
 
@@ -120,7 +124,7 @@ data/
       patch_NNNN_input_10m.tif      5 bands   256x256  S1 VV, S1 VH, NDVI, NDBI, permanent water
       patch_NNNN_input_80m.tif      5 bands   32x32    MERIT elev, flowdir sin/cos, UDA, HAND
       patch_NNNN_input_160m.tif     2 bands   16x16    clay, sand
-      patch_NNNN_input_2560m.tif    2N bands  1x1      precipitation (N) + soil moisture (N)
+      patch_NNNN_input_2560m.tif    2N bands  5x5      precipitation (N) + soil moisture (N), ~11 km grid
       patch_NNNN_flood_mask.tif     1 band    256x256  CEMS flood label
   metadata/
     1_activation_catalog.csv        activation catalog (Script 1)

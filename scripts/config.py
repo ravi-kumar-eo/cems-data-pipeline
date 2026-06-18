@@ -74,6 +74,13 @@ STRIDE_M: int       = 2560    # no overlap
 MIN_VALID_RATIO: float = 0.1  # drop a patch with <10% valid 10 m pixels
 PATCH_NODATA: int   = 9999    # nodata for input stacks (flood mask uses 0)
 
+# The coarse temporal layers (precipitation, soil moisture) are not resampled to
+# the patch grid. Each patch instead keeps a small window of native ~11 km pixels
+# centred on the patch, sampled at TEMPORAL_STEP_DEG spacing. So input_2560m is a
+# TEMPORAL_WINDOW_K x TEMPORAL_WINDOW_K grid per day, not a single pixel.
+TEMPORAL_WINDOW_K: int    = 5     # 5x5 grid of weather pixels per patch
+TEMPORAL_STEP_DEG: float  = 0.1   # ~11 km spacing (GPM-IMERG / SMAP native grid)
+
 
 # ─── PATHS ────────────────────────────────────────────────────────────────────
 
