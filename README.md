@@ -1,6 +1,35 @@
-# CEMS Flood Dataset Pipeline
+# CEMS Multi-Resolution Flood Dataset
 
-A pipeline to build a multi-resolution flood dataset from Copernicus EMSR rapid mapping activations and EO data from GEE. Covers the full workflow from raw CEMS product download and DCC conversion to GEE export submission, Drive retrieval, and final dataset preprocessing. Each processed activation produces 8 analysis-ready GeoTIFFs at mixed resolutions (10 m to 9 km), including a binary flood mask rasterized from the official CEMS delineation, aligned to a common grid.
+A ready-to-train, multi-modal global flood dataset built from Copernicus EMSR rapid-mapping activations and Earth-observation layers. The dataset ships as model-ready **patch tiles** with an activation- and basin-exclusive train/validation/test split, so you can download it and start training without touching Google Earth Engine. The open pipeline that builds it is included, so the dataset can also be reproduced or extended to new flood events.
+
+**Dataset:** [Zenodo DOI — to be added]
+
+## Two ways to use this
+
+- **Train now — download the patches.** Get the patch dataset from Zenodo and load the tiles directly. Each 2.56 km tile carries co-registered inputs at four resolutions plus the flood label, with the train/val/test split already assigned. No GEE account, no building required.
+- **Build or extend — run the pipeline.** Use the scripts to regenerate the dataset or extend it to flood activations newer than the release. This needs a GEE account and is described under *Building or extending the dataset* below.
+
+## The patch dataset
+
+Each cataloged flood event is cut into square, non-overlapping **2.56 km** tiles. Every tile is five co-registered GeoTIFFs — four input groups at their native resolutions plus the flood label:
+
+| File | Bands | Pixels | Contents |
+|---|---|---|---|
+| `patch_NNNN_input_10m.tif` | 5 | 256×256 | S1 VV, S1 VH, NDVI, NDBI, permanent water |
+| `patch_NNNN_input_80m.tif` | 5 | 32×32 | MERIT elevation, flow-dir sin, flow-dir cos, UDA, HAND |
+| `patch_NNNN_input_160m.tif` | 2 | 16×16 | SoilGrids clay %, sand % |
+| `patch_NNNN_input_2560m.tif` | 2N | 1×1 | precipitation (N days) + soil moisture (N days) |
+| `patch_NNNN_flood_mask.tif` | 1 | 256×256 | flood label (1 = flooded), CEMS delineation only |
+
+The flood mask is the official CEMS delineation alone. Permanent water (ESA WorldCover) is provided as a separate input band (band 5 of `input_10m`), so a model can tell pre-existing water from new flooding while the label stays the observed inundation. MERIT flow direction is encoded as the sine and cosine of its compass angle. `N` is the antecedent-window length (30 days by default), so `input_2560m` is 60 bands by default. A patch index, `patch_metadata.csv`, lists every tile with its event, bounds, basin, and split.
+
+The split is activation- and basin-exclusive at HydroBASINS Pfafstetter Level 5, so no basin or activation is shared between train, validation, and test, and scores reflect generalization to unseen events.
+
+---
+
+## Building or extending the dataset
+
+The remainder of this README documents the open pipeline that produces the dataset from scratch. Use it to reproduce the release or to extend the dataset to flood activations newer than it. Each processed activation produces 8 analysis-ready GeoTIFFs at mixed resolutions (10 m to 9 km), and Step 6 tiles them into the patches described above.
 
 **Per-activation GeoTIFF outputs (8 files per event: 7 GEE layers + flood mask):**
 
