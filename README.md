@@ -15,10 +15,10 @@ The flood records come from Copernicus activations. An activation (an EMSRXXX co
 | `patch_NNNN_input_10m.tif` | 5 | 256×256 | S1 VV, S1 VH, NDVI, NDBI, permanent water |
 | `patch_NNNN_input_80m.tif` | 5 | 32×32 | MERIT elevation, flow-dir sin, flow-dir cos, UDA, HAND |
 | `patch_NNNN_input_160m.tif` | 2 | 16×16 | SoilGrids clay %, sand % |
-| `patch_NNNN_input_2560m.tif` | 2N | 5×5 | precipitation (N days) + soil moisture (N days) |
+| `patch_NNNN_input_2560m.tif` | 2N | 1×1 | precipitation (N days) + soil moisture (N days) |
 | `patch_NNNN_flood_mask.tif` | 1 | 256×256 | flood label (1 = flooded) |
 
-With the default of 30 days, `input_2560m` has 60 bands. The first four files share the 2.56 km tile footprint at their own resolution. The weather layers are coarser than a tile (about 11 km per pixel), so resampling them to the tile would give one repeated value. Instead, `input_2560m` keeps a 5×5 grid of native weather pixels centred on the tile, sampled at 0.1° (about 11 km) spacing, so each tile sees the local spatial pattern of rainfall and soil moisture, not a single number. It is stored in geographic coordinates (EPSG:4326).
+With the default of 30 days, `input_2560m` has 60 bands. Every file shares the same 2.56 km ground footprint at its own resolution. The weather layers are coarser than a tile (about 11 km per pixel), so `input_2560m` is a single 2.56 km cell per tile, one value per day for precipitation and soil moisture.
 
 The flood label is the Copernicus CEMS flood delineation. Permanent water is a separate input band (band 5 of `input_10m`), taken from ESA WorldCover, so a model can separate pre-existing water from new flooding while the label stays the observed inundation. MERIT flow direction is given as the sine and cosine of its compass angle. A patch index, `patch_metadata.csv`, lists every tile with its event, bounds, basin, and split.
 
@@ -124,7 +124,7 @@ data/
       patch_NNNN_input_10m.tif      5 bands   256x256  S1 VV, S1 VH, NDVI, NDBI, permanent water
       patch_NNNN_input_80m.tif      5 bands   32x32    MERIT elev, flowdir sin/cos, UDA, HAND
       patch_NNNN_input_160m.tif     2 bands   16x16    clay, sand
-      patch_NNNN_input_2560m.tif    2N bands  5x5      precipitation (N) + soil moisture (N), ~11 km grid
+      patch_NNNN_input_2560m.tif    2N bands  1x1      precipitation (N) + soil moisture (N)
       patch_NNNN_flood_mask.tif     1 band    256x256  CEMS flood label
   metadata/
     1_activation_catalog.csv        activation catalog (Script 1)

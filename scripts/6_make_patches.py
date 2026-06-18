@@ -11,7 +11,7 @@ and is written at four resolutions plus the label, five files in all:
   patch_NNNN_input_10m.tif    256x256, 5 bands   S1 VV, S1 VH, NDVI, NDBI, permanent water
   patch_NNNN_input_80m.tif     32x32 , 5 bands   MERIT elevation, flowdir sin, flowdir cos, UDA, HAND
   patch_NNNN_input_160m.tif    16x16 , 2 bands   SoilGrids clay, sand
-  patch_NNNN_input_2560m.tif    5x5  , 2N bands  Precipitation (N) + SoilMoisture (N), N=30 default
+  patch_NNNN_input_2560m.tif    1x1  , 2N bands  Precipitation (N) + SoilMoisture (N), N=30 default
   patch_NNNN_flood_mask.tif   256x256, 1 band    CEMS flood extent (1 = flooded)
 
 The flood mask is the CEMS delineation only (flood_mask.tif from Step 4). It is
@@ -21,11 +21,6 @@ from new flooding but the label stays the raw observed inundation.
 
 MERIT flow direction (D8) is encoded as (sin, cos) of its compass angle so the
 circular variable has no artificial discontinuity at 0/360 degrees.
-
-The temporal layer (input_2560m) is not resampled to the patch grid. Each patch
-keeps a small window of native ~11 km weather pixels around it. The window is a
-WINDOW_K x WINDOW_K grid (5x5 by default) sampled at STEP_DEG spacing (0.1 deg),
-centred on the patch, for each of the N precipitation and N soil-moisture days.
 
 Input
   data/GEE_exports/{EMSR}/{folder}/  S1_VV_VH, S2_NDVI_NDBI, MERIT, Soil,
@@ -53,7 +48,7 @@ import numpy as np
 
 try:
     import rasterio
-    from rasterio.transform import from_bounds, from_origin, Affine
+    from rasterio.transform import from_bounds, Affine
     from rasterio.features import rasterize as rio_rasterize
     from rasterio.warp import reproject, Resampling
 except ImportError:
@@ -62,9 +57,8 @@ except ImportError:
 
 try:
     import geopandas as gpd
-    from pyproj import Transformer
 except ImportError:
-    print("ERROR: geopandas/pyproj not found. Install with: pip install geopandas pyproj")
+    print("ERROR: geopandas not found. Install with: pip install geopandas")
     sys.exit(1)
 
 import config
@@ -85,16 +79,12 @@ STRIDE_M        = config.STRIDE_M
 MIN_VALID_RATIO = config.MIN_VALID_RATIO
 NODATA          = config.PATCH_NODATA
 
-# Resolution (m) of the gridded stacks and the per-patch pixel grid each produces.
-RES_10M, RES_80M, RES_160M = 10.0, 80.0, 160.0
+# Resolution (m) of each stack and the per-patch pixel grid it produces.
+RES_10M, RES_80M, RES_160M, RES_2560M = 10.0, 80.0, 160.0, 2560.0
 PX_10M   = int(PATCH_SIZE_M / RES_10M)     # 256
 PX_80M   = int(PATCH_SIZE_M / RES_80M)     # 32
 PX_160M  = int(PATCH_SIZE_M / RES_160M)    # 16
-
-# Temporal window (input_2560m): a K x K grid of native ~11 km weather pixels
-# centred on each patch, not a value resampled onto the patch grid.
-WINDOW_K  = config.TEMPORAL_WINDOW_K       # 5
-STEP_DEG  = config.TEMPORAL_STEP_DEG       # 0.1 deg (~11 km)
+PX_2560M = int(PATCH_SIZE_M / RES_2560M)   # 1
 
 # Canonical per-event layer filenames (post Step 4 rename).
 F_S1    = "S1_VV_VH.tif"
@@ -120,7 +110,7 @@ EXPECTED = {
     "input_10m":   (5, PX_10M,   PX_10M),
     "input_80m":   (5, PX_80M,   PX_80M),
     "input_160m":  (2, PX_160M,  PX_160M),
-    "input_2560m": (N_2560M, WINDOW_K, WINDOW_K),
+    "input_2560m": (N_2560M, PX_2560M, PX_2560M),
     "flood_mask":  (1, PX_10M,   PX_10M),
 }
 
@@ -226,68 +216,22 @@ def build_stack_160m(gee: Path, ref_bounds, ref_crs):
     return stack, transform
 
 
-def load_temporal(gee: Path):
+def build_stack_2560m(gee: Path, ref_bounds, ref_crs):
     """
-    Load the two dated temporal rasters (precipitation, soil moisture) once for an
-    event. Returns (precip_data, precip_transform, sm_data, sm_transform), each in
-    its native EPSG:4326 grid, or None entries where a layer is missing. These are
-    sampled per patch in sample_temporal_window().
+    Precipitation (N_DAYS) + SoilMoisture (N_DAYS) -> (2*N_DAYS, H, W) at 2560 m.
+    Reads every band of each dated temporal file (no cap), so the patch follows
+    the configured antecedent-window length.
     """
-    out = {}
-    for key, pattern in (("pre", G_PRE), ("sm", G_SM)):
+    w, h, transform = _grid(ref_bounds, RES_2560M)
+    stack = np.full((N_2560M, h, w), NODATA, dtype=np.float32)
+    for pattern, base in ((G_PRE, 0), (G_SM, N_DAYS)):
         p = _find_one(gee, pattern)
         if p is None:
-            out[key] = (None, None)
             continue
         with rasterio.open(p) as src:
-            data = src.read().astype(np.float32)   # (N_DAYS, H, W)
-            if src.nodata is not None:
-                data[data == src.nodata] = NODATA
-            out[key] = (data, src.transform)
-    return out["pre"][0], out["pre"][1], out["sm"][0], out["sm"][1]
-
-
-def _sample_window(data, transform, lon, lat):
-    """
-    Sample every band of an EPSG:4326 raster over a WINDOW_K x WINDOW_K grid
-    centred on (lon, lat) at STEP_DEG spacing. Row 0 is north. Grid points outside
-    the raster clamp to the nearest edge pixel. Returns (bands, WINDOW_K, WINDOW_K).
-    """
-    B, H, W = data.shape
-    out = np.full((B, WINDOW_K, WINDOW_K), NODATA, dtype=np.float32)
-    half = WINDOW_K // 2
-    for i in range(WINDOW_K):                 # row, north -> south
-        plat = lat + (half - i) * STEP_DEG
-        for j in range(WINDOW_K):             # col, west -> east
-            plon = lon + (j - half) * STEP_DEG
-            col = int((plon - transform.c) / transform.a)
-            row = int((plat - transform.f) / transform.e)
-            row = min(max(row, 0), H - 1)
-            col = min(max(col, 0), W - 1)
-            out[:, i, j] = data[:, row, col]
-    return out
-
-
-def temporal_window_for_patch(temporal, to_wgs84, patch_cx, patch_cy):
-    """
-    Build the (2*N_DAYS, WINDOW_K, WINDOW_K) temporal window for one patch.
-    patch_cx, patch_cy is the patch centroid in the event CRS; it is converted to
-    lon/lat and used to centre the window. Returns (window, win_transform).
-    """
-    pre_d, pre_t, sm_d, sm_t = temporal
-    lon, lat = to_wgs84.transform(patch_cx, patch_cy)
-
-    window = np.full((N_2560M, WINDOW_K, WINDOW_K), NODATA, dtype=np.float32)
-    if pre_d is not None:
-        window[:N_DAYS] = _sample_window(pre_d, pre_t, lon, lat)
-    if sm_d is not None:
-        window[N_DAYS:] = _sample_window(sm_d, sm_t, lon, lat)
-
-    half = WINDOW_K // 2
-    win_t = from_origin(lon - (half + 0.5) * STEP_DEG,
-                        lat + (half + 0.5) * STEP_DEG,
-                        STEP_DEG, STEP_DEG)
-    return window, win_t
+            for i in range(min(src.count, N_DAYS)):
+                _reproject_band(src, i + 1, stack[base + i], transform, ref_crs, Resampling.average)
+    return stack, transform
 
 
 def build_flood_mask(gee: Path, ref_bounds, ref_crs):
@@ -333,47 +277,41 @@ def has_valid_data(patch) -> bool:
     return (np.sum(patch != NODATA) / patch.size) >= MIN_VALID_RATIO
 
 
-def write_patch(stacks, transforms, ref_crs, temporal, to_wgs84,
-                idx, r10, c10, out_dir) -> Optional[Dict]:
+def write_patch(stacks, transforms, ref_crs, idx, r10, c10, out_dir) -> Optional[Dict]:
     """
     Extract + write one patch across all resolutions. Returns a metadata dict on
-    success, or None if the patch is mostly nodata (skipped). The temporal layer
-    (input_2560m) is a window of native weather pixels centred on the patch, built
-    here from the patch centroid rather than sliced from an event stack.
+    success, or None if the patch is mostly nodata (skipped).
     """
-    s10, s80, s160, mask = stacks
-    t10, t80, t160, tmask = transforms
+    s10, s80, s160, s2560, mask = stacks
+    t10, t80, t160, t2560, tmask = transforms
     name = f"patch_{idx:04d}"
 
     p10 = s10[:, r10:r10 + PX_10M, c10:c10 + PX_10M]
     if not has_valid_data(p10):
         return None
 
-    r80, c80   = r10 // 8,  c10 // 8
-    r160, c160 = r10 // 16, c10 // 16
+    r80, c80     = r10 // 8,   c10 // 8
+    r160, c160   = r10 // 16,  c10 // 16
+    r2560, c2560 = r10 // 256, c10 // 256
 
     p80   = s80[:, r80:r80 + PX_80M, c80:c80 + PX_80M]
     p160  = s160[:, r160:r160 + PX_160M, c160:c160 + PX_160M]
+    p2560 = s2560[:, r2560:r2560 + PX_2560M, c2560:c2560 + PX_2560M]
     pmask = mask[r10:r10 + PX_10M, c10:c10 + PX_10M][np.newaxis]
-
-    # Patch centroid in the event CRS, used to centre the temporal window.
-    t10p = t10 * Affine.translation(c10, r10)
-    patch_cx, patch_cy = t10p * (PX_10M * 0.5, PX_10M * 0.5)
-    p2560, win_t = temporal_window_for_patch(temporal, to_wgs84, patch_cx, patch_cy)
 
     out_dir.mkdir(parents=True, exist_ok=True)
     items = [
-        (p10,   f"{name}_input_10m.tif",   t10,   c10, r10, ref_crs,       "float32"),
-        (p80,   f"{name}_input_80m.tif",   t80,   c80, r80, ref_crs,       "float32"),
-        (p160,  f"{name}_input_160m.tif",  t160,  c160, r160, ref_crs,     "float32"),
-        (p2560, f"{name}_input_2560m.tif", win_t, 0,   0,   "EPSG:4326",   "float32"),
-        (pmask, f"{name}_flood_mask.tif",  tmask, c10, r10, ref_crs,       "uint8"),
+        (p10,   f"{name}_input_10m.tif",   t10,   c10,   r10,   "float32"),
+        (p80,   f"{name}_input_80m.tif",   t80,   c80,   r80,   "float32"),
+        (p160,  f"{name}_input_160m.tif",  t160,  c160,  r160,  "float32"),
+        (p2560, f"{name}_input_2560m.tif", t2560, c2560, r2560, "float32"),
+        (pmask, f"{name}_flood_mask.tif",  tmask, c10,   r10,   "uint8"),
     ]
-    for data, fname, base_t, coff, roff, crs, dtype in items:
+    for data, fname, base_t, coff, roff, dtype in items:
         t = base_t * Affine.translation(coff, roff)
         profile = {
             "driver": "GTiff", "height": data.shape[1], "width": data.shape[2],
-            "count": data.shape[0], "dtype": dtype, "crs": crs,
+            "count": data.shape[0], "dtype": dtype, "crs": ref_crs,
             "transform": t, "compress": "lzw",
             "nodata": None if dtype == "uint8" else NODATA,
         }
@@ -381,8 +319,9 @@ def write_patch(stacks, transforms, ref_crs, temporal, to_wgs84,
             dst.write(data.astype(dtype))
 
     # Patch bounds from its 10 m transform.
-    minx, maxy = t10p * (0, 0)
-    maxx, miny = t10p * (PX_10M, PX_10M)
+    t = t10 * Affine.translation(c10, r10)
+    minx, maxy = t * (0, 0)
+    maxx, miny = t * (PX_10M, PX_10M)
     return {
         "patch_number": idx,
         "crs": str(ref_crs),
@@ -478,23 +417,18 @@ def main():
             ref_crs, ref_bounds = src.crs, src.bounds
 
         t0 = time.time()
-        s10,  t10  = build_stack_10m(gee, ref_bounds, ref_crs)
-        s80,  t80  = build_stack_80m(gee, ref_bounds, ref_crs)
-        s160, t160 = build_stack_160m(gee, ref_bounds, ref_crs)
-        mask, tmask = build_flood_mask(gee, ref_bounds, ref_crs)
-        stacks     = (s10, s80, s160, mask)
-        transforms = (t10, t80, t160, tmask)
-
-        # Native temporal rasters (EPSG:4326), sampled per patch into a centred
-        # window; plus a transformer from the event CRS to lon/lat.
-        temporal = load_temporal(gee)
-        to_wgs84 = Transformer.from_crs(ref_crs, "EPSG:4326", always_xy=True)
+        s10,   t10   = build_stack_10m(gee, ref_bounds, ref_crs)
+        s80,   t80   = build_stack_80m(gee, ref_bounds, ref_crs)
+        s160,  t160  = build_stack_160m(gee, ref_bounds, ref_crs)
+        s2560, t2560 = build_stack_2560m(gee, ref_bounds, ref_crs)
+        mask,  tmask = build_flood_mask(gee, ref_bounds, ref_crs)
+        stacks     = (s10, s80, s160, s2560, mask)
+        transforms = (t10, t80, t160, t2560, tmask)
 
         grid = patch_grid(s10.shape[2], s10.shape[1])
         saved = 0
         for idx, (r10, c10) in enumerate(grid):
-            meta = write_patch(stacks, transforms, ref_crs, temporal, to_wgs84,
-                               idx, r10, c10, out_dir)
+            meta = write_patch(stacks, transforms, ref_crs, idx, r10, c10, out_dir)
             if meta is None:
                 continue
             meta.update({
