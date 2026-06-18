@@ -2,7 +2,7 @@
 """
 Script 2: Submit GEE Export Tasks for Flood Activations
 
-For each DCC activation in data/activations/ (output of Script 1), this
+For each activation in data/activations/ (output of Script 1), this
 script submits Google Earth Engine export tasks to Google Drive.
 
 7 multi-band GeoTIFFs per activation (7 GEE tasks):
@@ -28,7 +28,7 @@ Temporal Fallback Strategy (Smart Iterative with Real Coverage Checking):
       ✓ Uses .getInfo() to get ACTUAL coverage percentage (not blind server-side)
       ✓ Stops early when sufficient (doesn't waste computation on unneeded windows)
       ✓ Prints real coverage values (user visibility into what's happening)
-      ✓ Learned from proven production code (download_gee_layers_dcc.py)
+      ✓ Learned from proven production code (download_gee_layers.py)
 
   S2_indices (NDVI/NDBI):
     Iterative approach with REAL coverage measurement:
@@ -54,7 +54,7 @@ Temporal Fallback Strategy (Smart Iterative with Real Coverage Checking):
       ✓ Stops early when sufficient (doesn't build unneeded composites)
       ✓ Prints real coverage values for each step (user visibility)
       ✓ Only builds seasonal if truly needed
-      ✓ Learned from proven production code (download_gee_layers_dcc.py)
+      ✓ Learned from proven production code (download_gee_layers.py)
 
     Problem Solved:
       - Large AOIs covered by multiple S2 tiles
@@ -84,7 +84,7 @@ Modes:
 
 After GEE completes (typically hours):
   1. Run Script 3 (3_download_gee_exports.py) to download from Google Drive
-  2. Downloaded files will be in: data/GEE_exports/{dcc_folder_name}/{layer}.tif
+  2. Downloaded files will be in: data/GEE_exports/{act_folder_name}/{layer}.tif
   3. Run Script 4 to validate exports and produce flood_dataset.csv
 """
 
@@ -166,7 +166,7 @@ except ImportError:
 BASE_DIR     = Path(__file__).resolve().parent.parent
 DATA_DIR     = BASE_DIR / "data"
 META_DIR     = DATA_DIR / "metadata"
-DCC_ACTIVATIONS_DIR = DATA_DIR / "activations" / "activations_dcc"
+ACTIVATIONS_DIR = DATA_DIR / "activations" / "activations_reorganized"
 GEE_EXPORTS_DIR = DATA_DIR / "GEE_exports"
 GEE_TASKS_CSV            = config.CSV_GEE_EXPORT_STATUS
 
@@ -255,9 +255,9 @@ class DownloadTracker:
 
 # ─── UTILITIES ───────────────────────────────────────────────────────────────
 
-def _parse_event_date(dcc_folder_name: str) -> Optional[date]:
-    """Extract YYYYMMDD date from DCC folder name suffix."""
-    m = re.search(r"_(\d{8})$", dcc_folder_name)
+def _parse_event_date(act_folder_name: str) -> Optional[date]:
+    """Extract YYYYMMDD date from standardized folder name suffix."""
+    m = re.search(r"_(\d{8})$", act_folder_name)
     if not m:
         return None
     try:
@@ -268,9 +268,9 @@ def _parse_event_date(dcc_folder_name: str) -> Optional[date]:
         return None
 
 
-def _read_aoi_bounds(dcc_folder: Path) -> Optional[Tuple[float, float, float, float]]:
+def _read_aoi_bounds(act_folder: Path) -> Optional[Tuple[float, float, float, float]]:
     """Return (minx, miny, maxx, maxy) in WGS84 from AOI shapefile."""
-    aoi_shp = dcc_folder / "aoi" / "aoi.shp"
+    aoi_shp = act_folder / "aoi" / "aoi.shp"
     if not aoi_shp.exists():
         return None
     try:
@@ -316,7 +316,7 @@ def _gee_region(minx: float, miny: float, maxx: float, maxy: float):
 
 
 def _submit(image, description: str, file_prefix: str,
-            region, crs_transform: list, dcc_name: str, layer: str) -> bool:
+            region, crs_transform: list, act_name: str, layer: str) -> bool:
     """
     Submit one GEE export task.
     Returns True on success.
@@ -327,7 +327,7 @@ def _submit(image, description: str, file_prefix: str,
     task = ee.batch.Export.image.toDrive(
         image=image,
         description=short_desc,
-        folder=dcc_name,  # Use activation folder name instead of single shared folder
+        folder=act_name,  # Use activation folder name instead of single shared folder
         fileNamePrefix=file_prefix,
         crs="EPSG:4326",
         crsTransform=crs_transform,
@@ -441,7 +441,7 @@ def find_layer_in_exports(folder_name: str, layer_name: str) -> Optional[Path]:
 
 def update_download_tracking_csv(download_tracker: DownloadTracker):
     """
-    Scan activations_dcc and GEE_exports to update the export-status CSV.
+    Scan activations_reorganized and GEE_exports to update the export-status CSV.
 
     Creates:
         - the per-layer GEE export-status CSV (config.CSV_GEE_EXPORT_STATUS),
@@ -456,20 +456,20 @@ def update_download_tracking_csv(download_tracker: DownloadTracker):
     """
     print("\nUpdating download tracking CSV …")
 
-    if not DCC_ACTIVATIONS_DIR.exists():
-        print(f"  ! DCC activations dir not found: {DCC_ACTIVATIONS_DIR}")
+    if not ACTIVATIONS_DIR.exists():
+        print(f"  ! activations dir not found: {ACTIVATIONS_DIR}")
         return
 
     tracking_records = []
 
-    # DCC structure: activations_dcc/{EMSR_CODE}/{activation_folder}/
+    # standardized structure: activations_reorganized/{EMSR_CODE}/{activation_folder}/
     activation_folders = sorted(
-        sub for emsr_dir in DCC_ACTIVATIONS_DIR.iterdir() if emsr_dir.is_dir()
+        sub for emsr_dir in ACTIVATIONS_DIR.iterdir() if emsr_dir.is_dir()
         for sub in emsr_dir.iterdir() if sub.is_dir()
     )
 
     if not activation_folders:
-        print(f"  ! No activation folders found in {DCC_ACTIVATIONS_DIR}")
+        print(f"  ! No activation folders found in {ACTIVATIONS_DIR}")
         return
 
     print(f"  Scanning {len(activation_folders)} activation folders …")
@@ -706,7 +706,7 @@ def build_s2_indices(region, event_date: date):
       ✓ Stops early when coverage sufficient (doesn't waste computation)
       ✓ Prints real coverage percentages (user visibility)
       ✓ Only builds composites that are needed
-      ✓ Learned from proven production code (download_gee_layers_dcc.py)
+      ✓ Learned from proven production code (download_gee_layers.py)
 
     Returns 2-band image: NDVI, NDBI (no date information in bands).
     """
@@ -902,29 +902,29 @@ def build_s2_indices(region, event_date: date):
 
 # ─── MAIN ────────────────────────────────────────────────────────────────────
 
-def submit_for_activation(dcc_folder: Path, download_tracker: DownloadTracker) -> int:
+def submit_for_activation(act_folder: Path, download_tracker: DownloadTracker) -> int:
     """
-    Submit all missing GEE tasks for one DCC activation folder.
+    Submit all missing GEE tasks for one activation folder.
     Returns number of new tasks submitted.
     """
-    dcc_name = dcc_folder.name
+    act_name = act_folder.name
 
     # Extract EMSR code from folder name (e.g. EMSR773_AOI01_... → EMSR773)
-    emsr_code = dcc_name.split("_")[0] if "_" in dcc_name else dcc_name
+    emsr_code = act_name.split("_")[0] if "_" in act_name else act_name
 
     # Check if activation has any NA layers - skip if so
-    if download_tracker.has_na(dcc_name):
+    if download_tracker.has_na(act_name):
         print(f"    ⚠ Activation has NA layers (no images available) — skipping")
         return 0
 
     # Parse event date
-    event_date = _parse_event_date(dcc_name)
+    event_date = _parse_event_date(act_name)
     if not event_date:
-        print(f"    ! cannot parse event date from '{dcc_name}' — skipping")
+        print(f"    ! cannot parse event date from '{act_name}' — skipping")
         return 0
 
     # Read AOI bounds
-    bounds = _read_aoi_bounds(dcc_folder)
+    bounds = _read_aoi_bounds(act_folder)
     if not bounds:
         print(f"    ! no AOI shapefile found — skipping")
         return 0
@@ -936,11 +936,11 @@ def submit_for_activation(dcc_folder: Path, download_tracker: DownloadTracker) -
 
     # Helper: build Drive file prefix (creates subfolder in Drive)
     def prefix(layer: str) -> str:
-        return f"{dcc_name}/{layer}"
+        return f"{act_name}/{layer}"
 
     def desc(layer: str) -> str:
         import unicodedata, re as _re
-        safe = unicodedata.normalize("NFKD", dcc_name).encode("ascii", "ignore").decode("ascii")
+        safe = unicodedata.normalize("NFKD", act_name).encode("ascii", "ignore").decode("ascii")
         safe = _re.sub(r"[^a-zA-Z0-9._,:;\-]", "_", safe)
         return f"{safe[:70]}_{layer}"
 
@@ -959,7 +959,7 @@ def submit_for_activation(dcc_folder: Path, download_tracker: DownloadTracker) -
     # Submit one task per enabled layer, dispatched by kind.
     for spec in enabled_layers():
         key = spec.key
-        if not download_tracker.needs_submission(dcc_name, key):
+        if not download_tracker.needs_submission(act_name, key):
             continue
         print(f"      → {key}")
 
@@ -968,9 +968,9 @@ def submit_for_activation(dcc_folder: Path, download_tracker: DownloadTracker) -
             img = build(region, event_date)
             if img is None:
                 print(f"        ✗ Marked as NA (no images available)")
-                download_tracker.mark_layer_na(emsr_code, dcc_name, key)
+                download_tracker.mark_layer_na(emsr_code, act_name, key)
                 continue
-            ok = _submit(img, desc(key), prefix(key), region, crs_tf, dcc_name, key)
+            ok = _submit(img, desc(key), prefix(key), region, crs_tf, act_name, key)
 
         elif spec.kind == "temporal":
             deg = TEMPORAL_DEG.get(key, spec.resolution_m / 111000.0)
@@ -983,7 +983,7 @@ def submit_for_activation(dcc_folder: Path, download_tracker: DownloadTracker) -
             first_day = (event_date - timedelta(days=spec.n_days)).strftime("%Y%m%d")
             last_day  = (event_date - timedelta(days=1)).strftime("%Y%m%d")
             dated = f"{spec.filename[:-4]}_{first_day}_{last_day}"
-            ok = _submit(img, desc(dated), prefix(dated), t_region, t_tf, dcc_name, key)
+            ok = _submit(img, desc(dated), prefix(dated), t_region, t_tf, act_name, key)
 
         else:  # static
             img = spec.builder(region)
@@ -991,12 +991,12 @@ def submit_for_activation(dcc_folder: Path, download_tracker: DownloadTracker) -
             # same AOI footprint. ESA_PW (10 m) lands on the fine reference grid;
             # MERIT (90 m) and SoilGrids (250 m) keep their coarse native pixels.
             if abs(spec.resolution_m - 10.0) < 1e-6:
-                ok = _submit(img, desc(key), prefix(key), region, crs_tf, dcc_name, key)
+                ok = _submit(img, desc(key), prefix(key), region, crs_tf, act_name, key)
             else:
                 deg = spec.resolution_m / 111000.0
                 s_minx, s_miny, s_maxx, s_maxy, s_tf = _snap_bounds(*bounds, deg)
                 s_region = _gee_region(s_minx, s_miny, s_maxx, s_maxy)
-                ok = _submit(img, desc(key), prefix(key), s_region, s_tf, dcc_name, key)
+                ok = _submit(img, desc(key), prefix(key), s_region, s_tf, act_name, key)
 
         submitted += int(ok)
         time.sleep(REQUEST_DELAY)
@@ -1016,7 +1016,7 @@ def main():
     print("=" * 72)
     print("  GEE Export Task Submission  (Script 2)")
     print(f"  BASE_DIR         : {BASE_DIR}")
-    print(f"  Activations dir  : {DCC_ACTIVATIONS_DIR}")
+    print(f"  Activations dir  : {ACTIVATIONS_DIR}")
     print(f"  GEE exports dir  : {GEE_EXPORTS_DIR}")
     if status_only:
         print(f"  Mode             : UPDATE TRACKING ONLY (--update-tracking)")
@@ -1054,23 +1054,23 @@ def main():
     # ── GEE Task Submission ───────────────────────────────────────────────
     if submit_to_gee:
 
-        # ── Find DCC activation folders ───────────────────────────────────────
-        if not DCC_ACTIVATIONS_DIR.exists():
-            print(f"\n! DCC activations dir not found: {DCC_ACTIVATIONS_DIR}")
+        # ── Find activation folders ───────────────────────────────────────
+        if not ACTIVATIONS_DIR.exists():
+            print(f"\n! activations dir not found: {ACTIVATIONS_DIR}")
             print("  Run Script 1 first to download + convert activations.")
             sys.exit(1)
 
-        # DCC structure: activations_dcc/{EMSR_CODE}/{activation_folder}/
+        # standardized structure: activations_reorganized/{EMSR_CODE}/{activation_folder}/
         # Collect all activation subfolders (one level below EMSR parent)
         folders = sorted(
-            sub for emsr_dir in DCC_ACTIVATIONS_DIR.iterdir() if emsr_dir.is_dir()
+            sub for emsr_dir in ACTIVATIONS_DIR.iterdir() if emsr_dir.is_dir()
             for sub in emsr_dir.iterdir() if sub.is_dir()
         )
         if not folders:
-            print(f"\n! No activation folders in {DCC_ACTIVATIONS_DIR}")
+            print(f"\n! No activation folders in {ACTIVATIONS_DIR}")
             sys.exit(1)
 
-        print(f"\nFound {len(folders)} DCC activation folders")
+        print(f"\nFound {len(folders)} activation folders")
 
         if TEST_MODE:
             print(f"  TEST_MODE enabled: Processing ONLY first valid activation folder (year >= 2017)")
@@ -1082,21 +1082,21 @@ def main():
         processed_count = 0
 
         for i, folder in enumerate(folders, 1):
-            dcc_name = folder.name
+            act_name = folder.name
 
             # Skip activations before 2017
-            event_date = _parse_event_date(dcc_name)
+            event_date = _parse_event_date(act_name)
             if event_date and event_date.year < 2017:
                 continue
 
             # Skip activations with any NA layers
-            if download_tracker.has_na(dcc_name):
+            if download_tracker.has_na(act_name):
                 total_skipped_na += 1
                 continue
 
             # Count how many layers still need submission
             missing = [l for l in ALL_LAYERS
-                       if download_tracker.needs_submission(dcc_name, l)]
+                       if download_tracker.needs_submission(act_name, l)]
 
             if not missing:
                 total_skipped += 1
@@ -1105,7 +1105,7 @@ def main():
                     break
                 continue
 
-            print(f"\n[{i}/{len(folders)}] {dcc_name}")
+            print(f"\n[{i}/{len(folders)}] {act_name}")
             print(f"    Missing layers: {', '.join(missing)}")
 
             n = submit_for_activation(folder, download_tracker)

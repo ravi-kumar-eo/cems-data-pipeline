@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Script 1: Download EMSR Flood Activations → DCC Format
+Script 1: Download EMSR Flood Activations → standardized format
 
 Pipeline steps (all in one script, resumable):
   1. Fetch all flood activations in date range from Copernicus API
@@ -8,7 +8,7 @@ Pipeline steps (all in one script, resumable):
   3. Find PDF per product, extract acquisition date
   4. Extract data sources (pre/post-event sensor info) from PDF → CSV
   5. Validate required shapefiles (aoi, event)
-  6. Convert to DCC format (flat folders: aoi/, flood_extent/)
+  6. Convert to standardized format (flat folders: aoi/, flood_extent/)
 
 Resume logic:
   - data/metadata/activations_status.csv tracks per-product state
@@ -21,7 +21,7 @@ Output structure (relative to BASE_DIR, auto-detected from script location):
   │   ├── activations_raw/                       ← raw downloads
   │   │   └── EMSR657/
   │   │       └── AOI01_DaugavaRiver_DEL_MONIT01/   ← product folder (vectors + PDFs)
-  │   └── activations_dcc/                       ← DCC format
+  │   └── activations_reorganized/                       ← standardized format
   │       └── EMSR657/                          ← activation parent folder
   │           └── EMSR657_AOI01_DaugavaRiver_DEL_MONIT01_20230402/
   │               ├── aoi/aoi.shp          (+ .shx .dbf .prj ...)
@@ -49,7 +49,7 @@ API_THRESHOLD = 656
 # Seconds to wait between web requests (be polite to Copernicus servers)
 REQUEST_DELAY = 1.5
 
-# Shapefile component extensions to copy into DCC folders
+# Shapefile component extensions to copy into standardized folders
 SHAPEFILE_EXTENSIONS = ['.shp', '.shx', '.dbf', '.prj', '.cpg',
                          '.sbn', '.sbx', '.shp.xml', '.xml']
 # ─────────────────────────────────────────────────────────────────────────────
@@ -113,7 +113,7 @@ DATA_DIR    = BASE_DIR / "data"
 META_DIR    = DATA_DIR / "metadata"
 ACTIVATIONS = DATA_DIR / "activations"
 RAW_DIR     = ACTIVATIONS / "activations_raw"
-DCC_DIR     = ACTIVATIONS / "activations_dcc"
+ACT_DIR     = ACTIVATIONS / "activations_reorganized"
 TEMP_DIR    = DATA_DIR / "_temp"
 
 import config
@@ -127,7 +127,7 @@ STATUS_FIELDS = [
     "emsr_code", "product_folder", "event_type",
     "raw_downloaded", "pdf_found", "date_extracted", "event_date",
     "pre_event_sensor", "post_event_sensors",
-    "dcc_folder", "dcc_converted", "has_aoi", "has_event",
+    "act_folder", "reorg_converted", "has_aoi", "has_event",
     "skipped_reason", "last_updated",
 ]
 
@@ -174,9 +174,9 @@ class StatusTracker:
             for row in self._data.values():
                 writer.writerow(row)
 
-    def is_dcc_done(self, emsr_code: str, product_folder: str) -> bool:
+    def is_reorganized(self, emsr_code: str, product_folder: str) -> bool:
         rec = self.get(emsr_code, product_folder)
-        return bool(rec and rec.get("dcc_converted") == "yes")
+        return bool(rec and rec.get("reorg_converted") == "yes")
 
     def is_raw_done(self, emsr_code: str, product_folder: str) -> bool:
         rec = self.get(emsr_code, product_folder)
@@ -1209,12 +1209,12 @@ class ShapefileFinder:
         return None
 
 
-# ─── DCC CONVERTER ───────────────────────────────────────────────────────────
+# ─── ACTIVATION REORGANIZER ───────────────────────────────────────────────────────────
 
-class DCCConverter:
+class ActivationReorganizer:
     """
-    Copies shapefiles from a raw product folder into DCC format:
-      data/activations/{dcc_folder_name}/
+    Copies shapefiles from a raw product folder into standardized format:
+      data/activations/{act_folder_name}/
         aoi/aoi.{shp,shx,dbf,prj,...}            mapped area-of-interest footprint
         flood_extent/event.{shp,...}             observed flood delineation (label)
 
@@ -1226,9 +1226,9 @@ class DCCConverter:
     def __init__(self):
         self.finder = ShapefileFinder()
 
-    def convert(self, product_dir: Path, dcc_folder: Path) -> Tuple[bool, Dict[str, bool], str]:
+    def convert(self, product_dir: Path, act_folder: Path) -> Tuple[bool, Dict[str, bool], str]:
         """Returns (overall_success, {has_aoi, has_event}, message)."""
-        if dcc_folder.exists() and (dcc_folder / "aoi" / "aoi.shp").exists():
+        if act_folder.exists() and (act_folder / "aoi" / "aoi.shp").exists():
             return True, {"aoi": True, "event": True}, "already done"
 
         aoi_shp   = self.finder.find_aoi(product_dir)
@@ -1237,10 +1237,10 @@ class DCCConverter:
         if not aoi_shp:
             return False, {"aoi": False, "event": bool(event_shp)}, "missing aoi shapefile"
 
-        dcc_folder.mkdir(parents=True, exist_ok=True)
+        act_folder.mkdir(parents=True, exist_ok=True)
 
-        self._copy_shp(aoi_shp,   dcc_folder / "aoi",          "aoi")
-        self._copy_shp(event_shp, dcc_folder / "flood_extent", "event")
+        self._copy_shp(aoi_shp,   act_folder / "aoi",          "aoi")
+        self._copy_shp(event_shp, act_folder / "flood_extent", "event")
 
         return True, {"aoi": True, "event": True}, "ok"
 
@@ -1259,10 +1259,10 @@ def write_activations_catalog(status: 'StatusTracker', csv_path: Path):
     """Write activations.csv — catalog: folder name, date, pre/post sensors."""
     rows = []
     for (emsr_code, product_folder), rec in status._data.items():
-        if rec.get("dcc_converted") != "yes":
+        if rec.get("reorg_converted") != "yes":
             continue
-        dcc_folder_rel = rec.get("dcc_folder", "")
-        folder_name = dcc_folder_rel.split("/", 1)[-1] if "/" in dcc_folder_rel else dcc_folder_rel
+        act_folder_rel = rec.get("act_folder", "")
+        folder_name = act_folder_rel.split("/", 1)[-1] if "/" in act_folder_rel else act_folder_rel
         if not folder_name:
             continue
         rows.append({
@@ -1346,9 +1346,9 @@ def _emsr_num(code: str) -> Optional[int]:
     return int(m.group(1)) if m else None
 
 
-def _build_dcc_name(emsr_code: str, product_folder: str, date: Optional[str]) -> str:
+def _build_act_name(emsr_code: str, product_folder: str, date: Optional[str]) -> str:
     """
-    Build canonical DCC folder name:
+    Build canonical standardized folder name:
       EMSR657_AOI01_DaugavaRiver_DEL_MONIT01_20230402
     or without date if unknown:
       EMSR657_AOI01_DaugavaRiver_DEL_MONIT01_NODATE
@@ -1369,14 +1369,14 @@ def main():
     tee = _setup_logging()
 
     print("=" * 72)
-    print("  EMSR Flood Download + DCC Converter  (Script 1)")
+    print("  EMSR Flood Download + Activation Reorganizer  (Script 1)")
     print(f"  BASE_DIR   : {BASE_DIR}")
     print(f"  Date range : {DATE_START}  →  {DATE_END}")
     print("=" * 72)
     print()
 
     # Create directories
-    for d in [RAW_DIR, DCC_DIR, META_DIR, TEMP_DIR]:
+    for d in [RAW_DIR, ACT_DIR, META_DIR, TEMP_DIR]:
         d.mkdir(parents=True, exist_ok=True)
 
     # ── Step 1: fetch flood activations in date range ─────────────────────────
@@ -1407,10 +1407,10 @@ def main():
     status   = StatusTracker(STATUS_CSV)
     dl       = EMSRDownloader()
     pdf_p    = PDFParser()
-    dcc_conv = DCCConverter()
+    reorg_conv = ActivationReorganizer()
 
     # Stats
-    stats = dict(downloaded=0, dcc_ok=0, dcc_fail=0, errors=0)
+    stats = dict(downloaded=0, reorg_ok=0, reorg_fail=0, errors=0)
 
     total = len(flood_acts)
 
@@ -1467,7 +1467,7 @@ def main():
             print(f"      PDF: {pdf_path.name}")
 
             # ── Step 4b: skip reference/overview products (no event shp) ──
-            if not dcc_conv.finder.find_event(product_dir):
+            if not reorg_conv.finder.find_event(product_dir):
                 print(f"      –  skipping: no event shapefile (reference/overview product)")
                 status.upsert({"emsr_code": code, "product_folder": folder,
                                "event_type": event_type,                                "raw_downloaded": "yes",
@@ -1504,36 +1504,36 @@ def main():
             else:
                 print(f"      ↩  sources already extracted")
 
-            # ── Step 6: DCC conversion ─────────────────────────────────────
-            if status.is_dcc_done(code, folder):
-                print(f"      ↩  DCC already done")
-                stats["dcc_ok"] += 1
+            # ── Step 6: reorganization ─────────────────────────────────────
+            if status.is_reorganized(code, folder):
+                print(f"      ↩  already reorganized")
+                stats["reorg_ok"] += 1
                 continue
 
-            dcc_name   = _build_dcc_name(code, folder, date_str)
-            dcc_folder = DCC_DIR / code / dcc_name   # EMSR parent level added
+            act_name   = _build_act_name(code, folder, date_str)
+            act_folder = ACT_DIR / code / act_name   # EMSR parent level added
 
-            ok, flags, msg = dcc_conv.convert(product_dir, dcc_folder)
+            ok, flags, msg = reorg_conv.convert(product_dir, act_folder)
 
             if ok:
-                print(f"      ✓  DCC → {code}/{dcc_name}  "
+                print(f"      ✓  reorganized → {code}/{act_name}  "
                       f"[aoi={flags['aoi']} flood_extent={flags['event']}]")
-                stats["dcc_ok"] += 1
+                stats["reorg_ok"] += 1
                 status.upsert({
                     "emsr_code":      code,
                     "product_folder": folder,
-                    "dcc_folder":     f"{code}/{dcc_name}",
-                    "dcc_converted":  "yes",
+                    "act_folder":     f"{code}/{act_name}",
+                    "reorg_converted":  "yes",
                     "has_aoi":        "yes" if flags["aoi"]   else "no",
                     "has_event":      "yes" if flags["event"] else "no",
                 })
             else:
-                print(f"      ✗  DCC failed: {msg}")
-                stats["dcc_fail"] += 1
+                print(f"      ✗  reorganization failed: {msg}")
+                stats["reorg_fail"] += 1
                 status.upsert({
                     "emsr_code":      code,
                     "product_folder": folder,
-                    "dcc_converted":  "no",
+                    "reorg_converted":  "no",
                     "skipped_reason": msg,
                     "has_aoi":        "yes" if flags.get("aoi")   else "no",
                     "has_event":      "yes" if flags.get("event") else "no",
@@ -1561,12 +1561,12 @@ def main():
     print("=" * 72)
     print(f"  Flood activations   : {total}")
     print(f"  Products downloaded : {stats['downloaded']}")
-    print(f"  DCC conversions ok  : {stats['dcc_ok']}")
-    print(f"  DCC conversions fail: {stats['dcc_fail']}")
+    print(f"  reorganizations ok  : {stats['reorg_ok']}")
+    print(f"  reorganizations fail: {stats['reorg_fail']}")
     print(f"  Errors              : {stats['errors']}")
     print()
     print(f"  Activations catalog → {CATALOG_CSV}")
-    print(f"  DCC folders         → {DCC_DIR}")
+    print(f"  standardized folders         → {ACT_DIR}")
     print("=" * 72)
 
     tee.close()

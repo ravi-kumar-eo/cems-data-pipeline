@@ -1,17 +1,12 @@
 # CEMS Multi-Resolution Flood Dataset
 
-A ready-to-train, multi-modal global flood dataset built from Copernicus EMSR rapid-mapping activations and Earth-observation layers. The dataset ships as model-ready **patch tiles** with an activation- and basin-exclusive train/validation/test split, so you can download it and start training without touching Google Earth Engine. The open pipeline that builds it is included, so the dataset can also be reproduced or extended to new flood events.
+A multi-modal global flood dataset built from Copernicus EMSR rapid-mapping activations and Earth-observation layers. A Copernicus activation (an EMSRXXX code) is opened for a flood emergency and produces one or more mapped flood events. The dataset is released as patch tiles ready for model training, with a train, validation, and test split already assigned. The scripts that produce the dataset are included, so it can be reproduced or extended to new activations.
 
-**Dataset:** [Zenodo DOI — to be added]
-
-## Two ways to use this
-
-- **Train now — download the patches.** Get the patch dataset from Zenodo and load the tiles directly. Each 2.56 km tile carries co-registered inputs at four resolutions plus the flood label, with the train/val/test split already assigned. No GEE account, no building required.
-- **Build or extend — run the pipeline.** Use the scripts to regenerate the dataset or extend it to flood activations newer than the release. This needs a GEE account and is described under *Building or extending the dataset* below.
+**Dataset:** [Zenodo DOI to be added]
 
 ## The patch dataset
 
-Each cataloged flood event is cut into square, non-overlapping **2.56 km** tiles. Every tile is five co-registered GeoTIFFs — four input groups at their native resolutions plus the flood label:
+Each flood event is cut into square, non-overlapping 2.56 km tiles. A tile is five co-registered GeoTIFFs, four input groups at their native resolutions and the flood label. The daily layers cover `N` antecedent days, 30 by default, so the bands below are given in terms of `N`.
 
 | File | Bands | Pixels | Contents |
 |---|---|---|---|
@@ -19,23 +14,25 @@ Each cataloged flood event is cut into square, non-overlapping **2.56 km** tiles
 | `patch_NNNN_input_80m.tif` | 5 | 32×32 | MERIT elevation, flow-dir sin, flow-dir cos, UDA, HAND |
 | `patch_NNNN_input_160m.tif` | 2 | 16×16 | SoilGrids clay %, sand % |
 | `patch_NNNN_input_2560m.tif` | 2N | 1×1 | precipitation (N days) + soil moisture (N days) |
-| `patch_NNNN_flood_mask.tif` | 1 | 256×256 | flood label (1 = flooded), CEMS delineation only |
+| `patch_NNNN_flood_mask.tif` | 1 | 256×256 | flood label (1 = flooded) |
 
-The flood mask is the official CEMS delineation alone. Permanent water (ESA WorldCover) is provided as a separate input band (band 5 of `input_10m`), so a model can tell pre-existing water from new flooding while the label stays the observed inundation. MERIT flow direction is encoded as the sine and cosine of its compass angle. `N` is the antecedent-window length (30 days by default), so `input_2560m` is 60 bands by default. A patch index, `patch_metadata.csv`, lists every tile with its event, bounds, basin, and split.
+With the default of 30 days, `input_2560m` has 60 bands. The flood label is the Copernicus CEMS flood delineation. Permanent water is a separate input band (band 5 of `input_10m`), taken from ESA WorldCover, so a model can separate pre-existing water from new flooding while the label stays the observed inundation. MERIT flow direction is given as the sine and cosine of its compass angle. A patch index, `patch_metadata.csv`, lists every tile with its event, bounds, basin, and split.
 
-The split is activation- and basin-exclusive at HydroBASINS Pfafstetter Level 5, so no basin or activation is shared between train, validation, and test, and scores reflect generalization to unseen events.
+The split is assigned at HydroBASINS Pfafstetter Level 5 and is exclusive by basin and by activation, so no basin and no activation appears in more than one of the train, validation, and test sets.
+
+To train on the dataset, download the patches from the Zenodo link above. To reproduce or extend it, run the pipeline described below, which needs a Google Earth Engine account.
 
 ---
 
 ## Building or extending the dataset
 
-The remainder of this README documents the open pipeline that produces the dataset from scratch. Use it to reproduce the release or to extend the dataset to flood activations newer than it. Each processed activation produces 8 analysis-ready GeoTIFFs at mixed resolutions (10 m to 9 km), and Step 6 tiles them into the patches described above.
+The remainder of this README documents the open pipeline that produces the dataset from scratch. Use it to reproduce the release or to extend the dataset to newer activations. Each processed event produces 8 analysis-ready GeoTIFFs at mixed resolutions (10 m to 9 km), and Step 6 tiles them into the patches described above.
 
-**Per-activation GeoTIFF outputs (8 files per event: 7 GEE layers + flood mask):**
+**Per-event GeoTIFF outputs (8 files per event: 7 GEE layers + flood mask):**
 
 | File | Bands | Source | GEE Collection |
 |---|---|---|---|
-| `flood_mask.tif` | 1 (binary: 1=flooded) | Copernicus CEMS flood extent shapefile, 10 m | rasterized from DCC `flood_extent/event.shp` |
+| `flood_mask.tif` | 1 (binary: 1=flooded) | Copernicus CEMS flood extent shapefile, 10 m | rasterized from `flood_extent/event.shp` |
 | `S1_VV_VH.tif` | 2 (VV, VH) | Sentinel-1 SAR GRD, 10 m | `COPERNICUS/S1_GRD` |
 | `S2_NDVI_NDBI.tif` | 2 (NDVI, NDBI) | Sentinel-2 SR, 10 m | `COPERNICUS/S2_SR_HARMONIZED` |
 | `MERIT.tif` | 4 (elevation, flow dir, UDA, HAND) | MERIT Hydro, 90 m | `MERIT/Hydro/v1_0_1` |
@@ -44,9 +41,9 @@ The remainder of this README documents the open pipeline that produces the datas
 | `Precipitation_{first}_{last}.tif` | N (daily, N days pre-event) | GPM-IMERG V07 daily, ~11 km | `NASA/GPM_L3/IMERG_V07` |
 | `SoilMoisture_{first}_{last}.tif` | N (daily, N days pre-event) | SMAP L4 surface SM, ~9 km | `NASA/SMAP/SPL4SMGP/008` |
 
-The seven geospatial layers above are configurable in `scripts/config.py` (`LAYER_TOGGLES` to enable/disable each layer, `N_DAYS_OVERRIDE` to set the daily-series length N per temporal layer, default 30). New GEE layers can be added by copying a template in `scripts/add_gee_layers.py`. `flood_mask.tif` (the rasterized CEMS delineation) is produced in Step 4; the permanent-water layer (`ESA_WorldCover_PermanentWater.tif`, ESA WorldCover) is exported directly from GEE. That gives 8 GeoTIFFs per activation. The temporal layers are written with their antecedent window stamped into the filename, e.g. `Precipitation_20240714_20240812.tif`.
+The seven geospatial layers above are configurable in `scripts/config.py`. `LAYER_TOGGLES` enables or disables each layer, and `N_DAYS_OVERRIDE` sets the daily-series length N per temporal layer (default 30). New GEE layers can be added by copying a template in `scripts/add_gee_layers.py`. `flood_mask.tif` is produced in Step 4 by rasterizing the CEMS delineation. The permanent-water layer (`ESA_WorldCover_PermanentWater.tif`) is exported directly from GEE. That gives 8 GeoTIFFs per event. The temporal layers carry their antecedent window in the filename, for example `Precipitation_20240714_20240812.tif`.
 
-Only two CEMS vector components are used per activation: the AOI boundary (`aoi/aoi.shp`) and the flood extent (`flood_extent/event.shp`). CEMS stopped shipping pre-event hydrography in 2023, so permanent water is taken from ESA WorldCover alone, which is available for every event.
+Two CEMS vector components are used per activation, the AOI boundary (`aoi/aoi.shp`) and the flood extent (`flood_extent/event.shp`). Permanent water comes from ESA WorldCover, which is available for every event.
 
 ---
 
@@ -67,10 +64,10 @@ earthengine authenticate
 Two one-time steps, both per Google Cloud project:
 
 1. **Enable the Drive API:** [console.cloud.google.com](https://console.cloud.google.com) → APIs & Services → Enable APIs → search **Google Drive API** → Enable  
-   *(Even with credentials.json in place, the API must be explicitly enabled in the project — this is separate from credentials)*
+   *(Even with credentials.json in place, the API must be explicitly enabled in the project. This is separate from credentials.)*
 2. **Download OAuth credentials:** APIs & Services → Credentials → Create Credentials → OAuth client ID → Desktop app → Download JSON → place in `Gdrive_credentials/` (any filename is fine)
 
-First run of Script 3 will open a browser for OAuth approval. The token is saved to `data/.gdrive_token.json` — no browser prompt on subsequent runs.
+First run of Script 3 will open a browser for OAuth approval. The token is saved to `data/.gdrive_token.json`, so subsequent runs do not prompt.
 
 ---
 
@@ -78,8 +75,8 @@ First run of Script 3 will open a browser for OAuth approval. The token is saved
 
 ```
 config.py                        Edit first: enable/disable layers, set daily-series length
-add_gee_layers.py                Layer registry — copy a template here to add a custom GEE layer
-1_download_activations.py        Download EMSR flood activations from Copernicus + convert to DCC format
+add_gee_layers.py                Layer registry. Copy a template here to add a custom GEE layer
+1_download_activations.py        Download EMSR flood activations from Copernicus + reorganize into standardized folders
 2_submit_gee_tasks.py            Submit GEE export tasks to Google Drive (enabled layers per activation)
                                  # wait for GEE tasks to complete (hours)
 3_download_gee_exports.py        Download all EMSR* folders from Google Drive to data/GEE_exports/
@@ -107,7 +104,7 @@ python scripts/6_make_patches.py
 data/
   activations/
     activations_raw/          raw Copernicus downloads
-    activations_dcc/          converted DCC format (aoi/, flood_extent/)
+    activations_reorganized/  standardized shapefiles (aoi/, flood_extent/)
   GEE_exports/
     {EMSR}/{folder_name}/     one folder per activation
       S1_VV_VH.tif                       2 bands  Sentinel-1 VV/VH
@@ -127,7 +124,7 @@ data/
       patch_NNNN_flood_mask.tif     1 band    256x256  CEMS flood label
   metadata/
     1_activation_catalog.csv        activation catalog (Script 1)
-    1_activation_status.csv         per-product download + DCC status (Script 1)
+    1_activation_status.csv         per-product download + reorganization status (Script 1)
     2_gee_export_status.csv         per-layer GEE export status (Script 2)
     4_dataset_metadata.csv          final dataset catalog (Script 4)
     4_missing_layers_report.csv     missing enabled layers per activation (Script 4)

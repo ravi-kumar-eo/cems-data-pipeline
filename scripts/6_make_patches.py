@@ -8,11 +8,11 @@ patches and writes them as individual GeoTIFFs, then validates every patch.
 A patch covers PATCH_SIZE_M x PATCH_SIZE_M on the ground (2.56 km by default)
 and is written at four resolutions plus the label, five files in all:
 
-  patch_NNNN_input_10m.tif    256x256, 5 bands  S1 VV, S1 VH, NDVI, NDBI, permanent_water
-  patch_NNNN_input_80m.tif     32x32 , 5 bands  MERIT elevation, flowdir sin, flowdir cos, UDA, HAND
-  patch_NNNN_input_160m.tif    16x16 , 2 bands  SoilGrids clay, sand
-  patch_NNNN_input_2560m.tif    1x1  , 20 bands Precipitation (10) + SoilMoisture (10)
-  patch_NNNN_flood_mask.tif   256x256, 1 band   CEMS flood extent (1 = flooded)
+  patch_NNNN_input_10m.tif    256x256, 5 bands   S1 VV, S1 VH, NDVI, NDBI, permanent water
+  patch_NNNN_input_80m.tif     32x32 , 5 bands   MERIT elevation, flowdir sin, flowdir cos, UDA, HAND
+  patch_NNNN_input_160m.tif    16x16 , 2 bands   SoilGrids clay, sand
+  patch_NNNN_input_2560m.tif    1x1  , 2N bands  Precipitation (N) + SoilMoisture (N), N=30 default
+  patch_NNNN_flood_mask.tif   256x256, 1 band    CEMS flood extent (1 = flooded)
 
 The flood mask is the CEMS delineation only (flood_mask.tif from Step 4). It is
 never altered with permanent water. Permanent water is provided as a separate
@@ -24,8 +24,8 @@ circular variable has no artificial discontinuity at 0/360 degrees.
 
 Input
   data/GEE_exports/{EMSR}/{folder}/  S1_VV_VH, S2_NDVI_NDBI, MERIT, Soil,
-                                     permanent_water, Precipitation, SoilMoisture,
-                                     flood_mask  (all from Steps 2-4)
+                                     ESA_WorldCover_PermanentWater, Precipitation,
+                                     SoilMoisture, flood_mask  (all from Steps 2-4)
   data/metadata/complete_dataset_metadata.csv   the catalog (one row per event)
 
 Output
@@ -66,7 +66,7 @@ import config
 # ── PATHS ─────────────────────────────────────────────────────────────────────
 BASE_DIR            = config.BASE_DIR
 GEE_EXPORTS_DIR     = config.GEE_EXPORTS_DIR
-DCC_ACTIVATIONS_DIR = config.DCC_ACTIVATIONS_DIR
+ACTIVATIONS_DIR     = config.ACTIVATIONS_DIR
 PATCHES_DIR         = config.PATCHES_DIR
 META_DIR            = config.META_DIR
 CATALOG_CSV         = config.CSV_COMPLETE_METADATA

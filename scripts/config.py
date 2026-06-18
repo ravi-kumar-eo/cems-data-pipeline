@@ -81,14 +81,14 @@ BASE_DIR            = Path(__file__).resolve().parent.parent
 DATA_DIR            = BASE_DIR / "data"
 META_DIR            = DATA_DIR / "metadata"
 GEE_EXPORTS_DIR     = DATA_DIR / "GEE_exports"
-DCC_ACTIVATIONS_DIR = DATA_DIR / "activations" / "activations_dcc"
+ACTIVATIONS_DIR     = DATA_DIR / "activations" / "activations_reorganized"
 HYDROBASINS_DIR     = DATA_DIR / "hydrobasins"
 
 
 # ─── STEP-NUMBERED METADATA FILES ─────────────────────────────────────────────
 # Prefix = the pipeline step that writes the file.
 
-# Step 1 — EMSR acquisition + DCC standardization
+# Step 1 — EMSR acquisition + standardization
 CSV_ACTIVATION_STATUS   = META_DIR / "1_activation_status.csv"   # per-product resume state
 CSV_ACTIVATION_SENSORS  = META_DIR / "1_activation_sensors.csv"  # pre/post sensor + date from PDF
 CSV_ACTIVATION_CATALOG  = META_DIR / "1_activation_catalog.csv"  # first-draft catalog

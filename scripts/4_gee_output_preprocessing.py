@@ -73,7 +73,7 @@ BASE_DIR             = config.BASE_DIR
 DATA_DIR             = config.DATA_DIR
 META_DIR             = config.META_DIR
 GEE_EXPORTS_DIR      = config.GEE_EXPORTS_DIR
-DCC_ACTIVATIONS_DIR  = config.DCC_ACTIVATIONS_DIR
+ACTIVATIONS_DIR  = config.ACTIVATIONS_DIR
 ACTIVATIONS_CSV      = config.CSV_ACTIVATION_CATALOG
 GEE_TASKS_CSV        = config.CSV_GEE_EXPORT_STATUS
 DATASET_METADATA_CSV = config.CSV_DATASET_METADATA
@@ -464,7 +464,7 @@ def get_basin_id(aoi_shp_path: Path, basins_gdf: gpd.GeoDataFrame) -> Optional[s
 
 # ─── FLOOD MASK RASTERIZATION ────────────────────────────────────────────────
 
-def rasterize_flood_mask(export_folder: Path, dcc_folder: Path) -> bool:
+def rasterize_flood_mask(export_folder: Path, act_folder: Path) -> bool:
     """
     Rasterize flood_extent/event.shp to flood_mask.tif aligned to S1_VV_VH.tif.
     Binary output: 1 = flooded, 0 = not flooded. Skips if already exists.
@@ -472,7 +472,7 @@ def rasterize_flood_mask(export_folder: Path, dcc_folder: Path) -> bool:
     Returns True on success or if already exists, False on failure.
     """
     out_tif   = export_folder / "flood_mask.tif"
-    flood_shp = dcc_folder / "flood_extent" / "event.shp"
+    flood_shp = act_folder / "flood_extent" / "event.shp"
     s1_tif    = export_folder / "S1_VV_VH.tif"
 
     if out_tif.exists():
@@ -619,11 +619,11 @@ def main():
         export_folder = find_activation_in_exports(folder_name)
         if export_folder is None:
             continue
-        dcc_folder = DCC_ACTIVATIONS_DIR / emsr_code / folder_name
+        act_folder = ACTIVATIONS_DIR / emsr_code / folder_name
         if (export_folder / "flood_mask.tif").exists():
             mask_skip += 1
             continue
-        ok = rasterize_flood_mask(export_folder, dcc_folder)
+        ok = rasterize_flood_mask(export_folder, act_folder)
         if ok:
             mask_ok += 1
             print(f"  ✓ {folder_name}")
@@ -676,7 +676,7 @@ def main():
             continue
 
         # Detect region from AOI shapefile
-        aoi_shp = DCC_ACTIVATIONS_DIR / emsr_code / folder_name / "aoi" / "aoi.shp"
+        aoi_shp = ACTIVATIONS_DIR / emsr_code / folder_name / "aoi" / "aoi.shp"
         region = detect_region(aoi_shp) if aoi_shp.exists() else 'unknown'
 
         # Get basin ID
