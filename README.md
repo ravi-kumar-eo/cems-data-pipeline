@@ -13,7 +13,7 @@ The CEMS Multi-Resolution Flood Dataset is a global, machine-learning-ready data
 | Soil moisture | `NASA/SMAP/SPL4SMGP/008` | ~9 km | 30 daily (m³/m³) |
 | Flood label | CEMS flood extent (`event.shp`) | 10 m | inundation mask (1 = flooded) |
 
-The dataset is released as patch tiles with the train, validation, and test split already assigned, ready to load for model training. The full pipeline that produces these layers is included, so the release can be rebuilt from scratch or extended to new flood activations with a Google Earth Engine account.
+Every input precedes the flood, so the dataset poses flood **prediction** from antecedent conditions rather than post-event mapping. It is released as patch tiles with the train, validation, and test split already assigned, ready to load for model training. The full pipeline that produces the patches is included, so the release can be rebuilt from scratch or extended to new flood activations with a Google Earth Engine account.
 
 **Dataset:** [Zenodo DOI to be added]
 
@@ -31,7 +31,28 @@ The dataset is delivered as patches. Each flood event is cut into square, non-ov
 
 Only the 10 m layers are kept at their native resolution, as a 256×256 grid. The other layers are resampled so they integrate into a single multi-modal stack: each file covers the same 2.56 km × 2.56 km footprint, sampled to the grid that matches its resolution. Precipitation and soil moisture reduce to one cell per tile, one value per antecedent day, so `input_2560m` holds 2N bands. The released dataset uses 30 antecedent days, giving 60 bands, 30 precipitation days followed by 30 soil-moisture days. The number of days N is configurable in the pipeline (Section below), so a newly prepared dataset can use a different window.
 
-The permanent-water band lets a model tell pre-existing water from new flooding, while the label stays the observed CEMS inundation alone. MERIT flow direction is split into the sine and cosine of its compass angle so the circular variable has no discontinuity. A patch index, `data/metadata/patch_metadata.csv`, lists every tile with its event, bounds, basin, and split. The split is assigned at HydroBASINS Pfafstetter Level 5 and is exclusive by basin and by activation, so no basin and no activation crosses the train, validation, and test sets.
+The permanent-water band lets a model tell pre-existing water from new flooding, while the label stays the observed CEMS inundation alone. MERIT flow direction is split into the sine and cosine of its compass angle so the circular variable has no discontinuity.
+
+### Patch index and splits
+
+Every patch is listed in `data/metadata/patch_metadata.csv`, one row per tile. The three split files, `train_patches.csv`, `val_patches.csv`, and `test_patches.csv`, are the same table filtered by the `split` column, so each can be loaded directly as a training, validation, or test set. The split is assigned at HydroBASINS Pfafstetter Level 5 and is exclusive by basin and by activation, so no basin and no activation crosses the train, validation, and test sets.
+
+A tile is addressed by `(emsr_code, folder_name, patch_number)`, which locate its files on disk, so the CSV references patches relationally rather than by absolute path. The key columns are below.
+
+| Column | Description |
+|---|---|
+| `patch_index` | global running index over all patches |
+| `emsr_code` | Copernicus activation code, e.g. `EMSR203` |
+| `folder_name` | event the patch belongs to |
+| `patch_number` | index of the tile within its event (the `NNNN` in the filenames) |
+| `crs` | coordinate reference system of the tile (per-event UTM zone) |
+| `bounds_minx/miny/maxx/maxy` | tile footprint bounds in `crs` units (m) |
+| `transform_a..f` | affine geo-transform of the 10 m grid |
+| `resolution_class` | post-event sensor class: medium, high, or very-high |
+| `basin_id` | HydroBASINS Pfafstetter Level-5 code(s) of the event |
+| `continent` | continent of the event |
+| `flood_fraction` | fraction of flooded pixels in the tile, from the flood mask |
+| `split` | train, val, or test |
 
 ---
 
