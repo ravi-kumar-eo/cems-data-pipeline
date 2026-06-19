@@ -1,36 +1,36 @@
 # CEMS Multi-Resolution Flood Dataset
 
-A global dataset for flood mapping. Each sample pairs a stack of Earth-observation and weather layers with the observed flood extent, so a model can learn to predict which pixels are flooded. The labels come from Copernicus Emergency Management Service flood delineations, and the input layers are drawn from satellite imagery, terrain, soil, and pre-event weather.
+The CEMS Multi-Resolution Flood Dataset is a global, machine-learning-ready dataset for flood mapping. It pairs **463,334** co-registered image patches with observed flood extents from **1,553** Copernicus Emergency Management Service (CEMS) flood events, drawn from **188** rapid-mapping activations between 2017 and 2025 and spanning **281** river basins, six continents, and all five Köppen climate zones.
 
-The dataset is released as image tiles that are ready for model training, with a train, validation, and test split already assigned. The scripts that produce it are included, so it can be reproduced or extended to new flood events.
+Each patch stacks four input groups at their native resolutions — 10 m Sentinel-1 SAR and Sentinel-2 indices, 80 m MERIT terrain, 160 m SoilGrids, and a 2.56 km cell of daily pre-event precipitation and soil moisture — against a 10 m flood label. The radar is acquired *before* the flood, so the task the dataset poses is flood **prediction** from antecedent conditions, not post-event mapping. The weather layers carry a 30-day window of daily precipitation and soil moisture leading up to each event, giving a model the rainfall and wetness history that drives inundation.
+
+The patches ship ready for training with a train, validation, and test split already fixed at HydroBASINS Pfafstetter Level 5, exclusive by basin and by activation so that no basin and no activation crosses splits. The full reproduction pipeline is included, so the release can be rebuilt from scratch or extended to new activations with a Google Earth Engine account.
 
 **Dataset:** [Zenodo DOI to be added]
 
 ## The patch dataset
 
-The flood records come from Copernicus activations. An activation (an EMSRXXX code) is opened for a flood emergency and produces one or more mapped flood events. Each event is cut into square, non-overlapping 2.56 km tiles. A tile is five co-registered GeoTIFFs, four input groups at their own resolution and the flood label. The weather layers cover `N` days before the flood, 30 by default, so the bands below are written in terms of `N`.
+Each of the 1,553 flood events is cut into square, non-overlapping 2.56 km tiles. A tile is five co-registered GeoTIFFs: four input groups at their own resolution and the flood label. The weather layers cover `N` days before the flood, 30 by default, so the bands below are written in terms of `N`.
 
 | File | Bands | Pixels | Contents |
 |---|---|---|---|
 | `patch_NNNN_input_10m.tif` | 5 | 256×256 | S1 VV, S1 VH, NDVI, NDBI, permanent water |
 | `patch_NNNN_input_80m.tif` | 5 | 32×32 | MERIT elevation, flow-dir sin, flow-dir cos, UDA, HAND |
 | `patch_NNNN_input_160m.tif` | 2 | 16×16 | SoilGrids clay %, sand % |
-| `patch_NNNN_input_2560m.tif` | 2N | 1×1 | precipitation (N days) + soil moisture (N days) |
+| `patch_NNNN_input_2560m.tif` | 2N | 1×1 | precipitation (N days) then soil moisture (N days) |
 | `patch_NNNN_flood_mask.tif` | 1 | 256×256 | flood label (1 = flooded) |
 
-With the default of 30 days, `input_2560m` has 60 bands. Every file shares the same 2.56 km ground footprint at its own resolution. The weather layers are coarser than a tile (about 11 km per pixel), so `input_2560m` is a single 2.56 km cell per tile, one value per day for precipitation and soil moisture.
+With the default `N` of 30, `input_2560m` holds 60 bands: precipitation for days 1–30, then soil moisture for days 1–30. Every file shares the same 2.56 km footprint at its own resolution; the weather layers are coarser than a tile, so `input_2560m` is a single 2.56 km cell.
 
-The flood label is the Copernicus CEMS flood delineation. Permanent water is a separate input band (band 5 of `input_10m`), taken from ESA WorldCover, so a model can separate pre-existing water from new flooding while the label stays the observed inundation. MERIT flow direction is given as the sine and cosine of its compass angle. A patch index, `patch_metadata.csv`, lists every tile with its event, bounds, basin, and split.
+The flood label is the CEMS flood delineation. Permanent water is a separate input band (band 5 of `input_10m`), taken from ESA WorldCover, so a model can tell pre-existing water from new flooding while the label stays the observed inundation. MERIT flow direction is split into the sine and cosine of its compass angle. The patch index `patch_metadata.csv` lists every tile with its event, bounds, basin, and split.
 
-The split is assigned at HydroBASINS Pfafstetter Level 5 and is exclusive by basin and by activation, so no basin and no activation appears in more than one of the train, validation, and test sets.
-
-To train on the dataset, download the patches from the Zenodo link above. To reproduce or extend it, run the pipeline described below, which needs a Google Earth Engine account.
+To train on the dataset, download the patches from the Zenodo link above. To reproduce or extend it, run the pipeline below.
 
 ---
 
 ## Building or extending the dataset
 
-The remainder of this README documents the open pipeline that produces the dataset from scratch. Use it to reproduce the release or to extend the dataset to newer activations. Each processed event produces 8 analysis-ready GeoTIFFs at mixed resolutions (10 m to 9 km), and Step 6 tiles them into the patches described above.
+The rest of this README documents the open pipeline that builds the dataset from scratch — use it to reproduce the release or to extend it to newer activations. The pipeline turns each event into 8 analysis-ready GeoTIFFs at mixed resolutions (10 m to 9 km), then Step 6 tiles them into the patches described above.
 
 **Per-event GeoTIFF outputs (8 files per event: 7 GEE layers + flood mask):**
 
@@ -47,7 +47,7 @@ The remainder of this README documents the open pipeline that produces the datas
 
 The seven geospatial layers above are configurable in `scripts/config.py`. `LAYER_TOGGLES` enables or disables each layer, and `N_DAYS_OVERRIDE` sets the daily-series length N per temporal layer (default 30). New GEE layers can be added by copying a template in `scripts/add_gee_layers.py`. `flood_mask.tif` is produced in Step 4 by rasterizing the CEMS delineation. The permanent-water layer (`ESA_WorldCover_PermanentWater.tif`) is exported directly from GEE. That gives 8 GeoTIFFs per event. The temporal layers carry their antecedent window in the filename, for example `Precipitation_20240714_20240812.tif`.
 
-Two CEMS vector components are used per activation, the AOI boundary (`aoi/aoi.shp`) and the flood extent (`flood_extent/event.shp`). Permanent water comes from ESA WorldCover, which is available for every event.
+Each activation supplies two CEMS vector components: the AOI boundary (`aoi/aoi.shp`) and the flood extent (`flood_extent/event.shp`). Permanent water comes from ESA WorldCover, which covers every event.
 
 ---
 
@@ -124,13 +124,14 @@ data/
       patch_NNNN_input_10m.tif      5 bands   256x256  S1 VV, S1 VH, NDVI, NDBI, permanent water
       patch_NNNN_input_80m.tif      5 bands   32x32    MERIT elev, flowdir sin/cos, UDA, HAND
       patch_NNNN_input_160m.tif     2 bands   16x16    clay, sand
-      patch_NNNN_input_2560m.tif    2N bands  1x1      precipitation (N) + soil moisture (N)
+      patch_NNNN_input_2560m.tif    2N bands  1x1      precipitation (N days) then soil moisture (N days)
       patch_NNNN_flood_mask.tif     1 band    256x256  CEMS flood label
   metadata/
     1_activation_catalog.csv        activation catalog (Script 1)
     1_activation_status.csv         per-product download + reorganization status (Script 1)
     2_gee_export_status.csv         per-layer GEE export status (Script 2)
-    4_dataset_metadata.csv          final dataset catalog (Script 4)
+    4_dataset_metadata.csv          events new in the latest run (Script 4)
+    complete_dataset_metadata.csv   full accumulated dataset catalog (Script 4)
     4_missing_layers_report.csv     missing enabled layers per activation (Script 4)
     5_split_info.json               split method, counts, exclusivity checks (Script 5)
     patch_metadata.csv              one row per patch tile (Script 6)
@@ -139,14 +140,20 @@ data/
 
 ---
 
-## Dataset CSV
+## Dataset catalog
+
+`complete_dataset_metadata.csv` has one row per event. Its `folder_name` keys into the patches, GEE_exports, and activations_reorganized folders.
 
 | column | description |
 |---|---|
-| `folder_name` | activation folder name |
-| `region` | europe / rest_of_world |
-| `basin_id` | HydroBASINS Pfafstetter Level-5 code |
-| `pre_event_sensor` | sensor used for pre-event image |
-| `post_event_sensors` | sensor(s) used for post-event image |
-| `resolution_post_sensor` | best post-event resolution in metres |
-| `resolution_class` | very-high / high / medium |
+| `folder_name` | event folder name |
+| `basin_id` | HydroBASINS Pfafstetter Level-5 code(s) |
+| `pre_event_sensor` | sensor of the pre-event reference image |
+| `post_event_sensors` | sensor(s) used for the flood delineation |
+| `resolution_post_sensor` | post-event sensor resolution (m) |
+| `resolution_class` | medium, high, or very-high |
+| `continent` | continent of the area of interest |
+| `climate` | Köppen-Geiger main class |
+| `split` | train, validation, or test |
+| `area_km2` | area of interest size (km²) |
+| `flood_area_km2` | area under water from the flood polygon (km²) |
