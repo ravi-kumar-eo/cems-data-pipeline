@@ -2,7 +2,7 @@
 
 The CEMS Multi-Resolution Flood Dataset is a global, machine-learning-ready dataset for flood mapping. It pairs **463,334** co-registered image patches with observed flood extents from **1,553** Copernicus Emergency Management Service (CEMS) flood events, drawn from **188** rapid-mapping activations between 2017 and 2025 and spanning **281** river basins, six continents, and all five Köppen climate zones.
 
-Each patch stacks four input groups at their native resolutions — 10 m Sentinel-1 SAR and Sentinel-2 indices, 80 m MERIT terrain, 160 m SoilGrids, and a 2.56 km cell of daily pre-event precipitation and soil moisture — against a 10 m flood label. The radar is acquired *before* the flood, so the task the dataset poses is flood **prediction** from antecedent conditions, not post-event mapping. The weather layers carry a 30-day window of daily precipitation and soil moisture leading up to each event, giving a model the rainfall and wetness history that drives inundation.
+Each patch stacks four co-registered input groups at their native resolutions (10 m to 2.56 km) against a 10 m flood label. Every input is from before the flood, including a 30-day daily series of precipitation and soil moisture leading up to the event, so the dataset poses flood **prediction** from pre-event conditions rather than post-event mapping. The five files of a patch are listed below.
 
 The patches ship ready for training with a train, validation, and test split already fixed at HydroBASINS Pfafstetter Level 5, exclusive by basin and by activation so that no basin and no activation crosses splits. The full reproduction pipeline is included, so the release can be rebuilt from scratch or extended to new activations with a Google Earth Engine account.
 
@@ -10,7 +10,7 @@ The patches ship ready for training with a train, validation, and test split alr
 
 ## The patch dataset
 
-Each of the 1,553 flood events is cut into square, non-overlapping 2.56 km tiles. A tile is five co-registered GeoTIFFs: four input groups at their own resolution and the flood label. The weather layers cover `N` days before the flood, 30 by default, so the bands below are written in terms of `N`.
+Each of the 1,553 flood events is cut into square, non-overlapping 2.56 km tiles. A tile is five co-registered GeoTIFFs: four input groups at their own resolution and the flood label. The daily precipitation and soil moisture cover `N` days before the flood, 30 by default, so the bands below are written in terms of `N`.
 
 | File | Bands | Pixels | Contents |
 |---|---|---|---|
@@ -30,7 +30,7 @@ To train on the dataset, download the patches from the Zenodo link above. To rep
 
 ## Building or extending the dataset
 
-The rest of this README documents the open pipeline that builds the dataset from scratch — use it to reproduce the release or to extend it to newer activations. The pipeline turns each event into 8 analysis-ready GeoTIFFs at mixed resolutions (10 m to 9 km), then Step 6 tiles them into the patches described above.
+The rest of this README documents the open pipeline that builds the dataset from scratch. Use it to reproduce the release or to extend it to newer activations. The pipeline turns each event into 8 analysis-ready GeoTIFFs at mixed resolutions (10 m to 9 km), then Step 6 tiles them into the patches described above.
 
 **Per-event GeoTIFF outputs (8 files per event: 7 GEE layers + flood mask):**
 
