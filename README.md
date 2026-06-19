@@ -2,50 +2,46 @@
 
 The CEMS Multi-Resolution Flood Dataset is a global, machine-learning-ready dataset for flood mapping. It pairs **463,334** co-registered image patches with observed flood extents from **1,553** Copernicus Emergency Management Service (CEMS) flood events, drawn from **188** rapid-mapping activations between 2017 and 2025 and spanning **281** river basins, six continents, and all five Köppen climate zones.
 
-Each patch carries the conditions a flood depends on: the land surface from Sentinel-1 and Sentinel-2, the terrain that routes water from MERIT Hydro, the soil that absorbs it from SoilGrids, and the antecedent precipitation and soil moisture that drive it. These come as four co-registered input groups at their native resolutions, from 10 m to 2.56 km, paired with the observed flood extent as a 10 m label. Every input is taken before the flood, including the 30 days of daily precipitation and soil moisture leading up to it, so the dataset poses flood **prediction** from pre-event conditions rather than post-event mapping.
+Each patch pairs the observed inundation label with the inputs that govern it. A pre-event precipitation and soil-moisture time series gives the antecedent wetness of the catchment. Sentinel-1 SAR backscatter, Sentinel-2 vegetation and built-up indices, MERIT Hydro terrain, SoilGrids soil texture, and a permanent-water mask give the flood conditioning factors that control runoff generation and accumulation. Every input precedes the flood, so the dataset poses flood **prediction** from antecedent conditions rather than post-event mapping.
 
-The patches ship ready for training with a train, validation, and test split already fixed at HydroBASINS Pfafstetter Level 5, exclusive by basin and by activation so that no basin and no activation crosses splits. The full reproduction pipeline is included, so the release can be rebuilt from scratch or extended to new activations with a Google Earth Engine account.
+| Layer | Source | Native resolution | Bands |
+|---|---|---|---|
+| Sentinel-1 SAR | `COPERNICUS/S1_GRD` | 10 m | VV, VH |
+| Sentinel-2 indices | `COPERNICUS/S2_SR_HARMONIZED` | 10 m | NDVI, NDBI |
+| MERIT Hydro | `MERIT/Hydro/v1_0_1` | 90 m | elevation, flow direction, UDA, HAND |
+| SoilGrids | `OpenLandMap/SOL` | 250 m | clay %, sand % |
+| ESA WorldCover | `ESA/WorldCover/v200` | 10 m | permanent-water mask |
+| Precipitation | `NASA/GPM_L3/IMERG_V07` | ~11 km | 30 daily (mm/day) |
+| Soil moisture | `NASA/SMAP/SPL4SMGP/008` | ~9 km | 30 daily (m³/m³) |
+| Flood label | CEMS flood extent (`event.shp`) | 10 m | inundation mask (1 = flooded) |
+
+The dataset is released as patch tiles with the train, validation, and test split already assigned, ready to load for model training. The full pipeline that produces these layers is included, so the release can be rebuilt from scratch or extended to new flood activations with a Google Earth Engine account.
 
 **Dataset:** [Zenodo DOI to be added]
 
-## The patch dataset
+## Dataset description
 
-Each event is cut into square, non-overlapping 2.56 km tiles, and each tile is stored as five GeoTIFFs: the four input groups and the flood label. The daily precipitation and soil moisture cover `N` days before the event, 30 by default, so the bands below are written in terms of `N`.
+The dataset is delivered as patches. Each flood event is cut into square, non-overlapping tiles that each cover a 2.56 km × 2.56 km ground footprint. **One patch is five GeoTIFFs: four input files and one flood-label file.** The four input files hold the layers above, grouped by resolution, and the label file holds the CEMS flood mask.
 
-| File | Bands | Pixels | Contents |
+| File | Bands | Size | Contents |
 |---|---|---|---|
-| `patch_NNNN_input_10m.tif` | 5 | 256×256 | S1 VV, S1 VH, NDVI, NDBI, permanent water |
-| `patch_NNNN_input_80m.tif` | 5 | 32×32 | MERIT elevation, flow-dir sin, flow-dir cos, UDA, HAND |
-| `patch_NNNN_input_160m.tif` | 2 | 16×16 | SoilGrids clay %, sand % |
-| `patch_NNNN_input_2560m.tif` | 2N | 1×1 | precipitation (N days) then soil moisture (N days) |
-| `patch_NNNN_flood_mask.tif` | 1 | 256×256 | flood label (1 = flooded) |
+| `input_10m.tif` | 5 | 256×256 | S1 VV, S1 VH, NDVI, NDBI, permanent water |
+| `input_80m.tif` | 5 | 32×32 | MERIT elevation, flow-dir sin, flow-dir cos, UDA, HAND |
+| `input_160m.tif` | 2 | 16×16 | SoilGrids clay %, sand % |
+| `input_2560m.tif` | 2N | 1×1 | precipitation (N days), soil moisture (N days) |
+| `flood_mask.tif` | 1 | 256×256 | flood label (1 = flooded) |
 
-With the default `N` of 30, `input_2560m` holds 60 bands: precipitation for days 1 to 30, then soil moisture for days 1 to 30. Every file shares the same 2.56 km footprint at its own resolution. Precipitation and soil moisture are coarser than a tile, so `input_2560m` is a single 2.56 km cell, one value per day.
+Only the 10 m layers are kept at their native resolution, as a 256×256 grid. The other layers are resampled so they integrate into a single multi-modal stack: each file covers the same 2.56 km × 2.56 km footprint, sampled to the grid that matches its resolution. Precipitation and soil moisture reduce to one cell per tile, one value per antecedent day, so `input_2560m` holds 2N bands. The released dataset uses 30 antecedent days, giving 60 bands, 30 precipitation days followed by 30 soil-moisture days. The number of days N is configurable in the pipeline (Section below), so a newly prepared dataset can use a different window.
 
-The flood label is the CEMS flood delineation. Permanent water is a separate input band (band 5 of `input_10m`), taken from ESA WorldCover, so a model can tell pre-existing water from new flooding while the label stays the observed inundation. MERIT flow direction is split into the sine and cosine of its compass angle. The patch index `patch_metadata.csv` lists every tile with its event, bounds, basin, and split.
-
-To train on the dataset, download the patches from the Zenodo link above. To reproduce or extend it, run the pipeline below.
+The permanent-water band lets a model tell pre-existing water from new flooding, while the label stays the observed CEMS inundation alone. MERIT flow direction is split into the sine and cosine of its compass angle so the circular variable has no discontinuity. A patch index, `data/metadata/patch_metadata.csv`, lists every tile with its event, bounds, basin, and split. The split is assigned at HydroBASINS Pfafstetter Level 5 and is exclusive by basin and by activation, so no basin and no activation crosses the train, validation, and test sets.
 
 ---
 
 ## Building or extending the dataset
 
-The rest of this README documents the open pipeline that builds the dataset from scratch. Use it to reproduce the release or to extend it to newer activations. The pipeline turns each event into 8 analysis-ready GeoTIFFs at mixed resolutions (10 m to 9 km), then Step 6 tiles them into the patches described above.
+The rest of this README documents the open pipeline that builds the dataset from scratch. Use it to reproduce the release or to extend it to newer activations. The pipeline produces the eight per-event layers of the overview table (the seven geospatial layers plus the flood mask) as full-scene GeoTIFFs, then Step 6 tiles them into the patches described above.
 
-**Per-event GeoTIFF outputs (8 files per event: 7 GEE layers + flood mask):**
-
-| File | Bands | Source | GEE Collection |
-|---|---|---|---|
-| `flood_mask.tif` | 1 (binary: 1=flooded) | Copernicus CEMS flood extent shapefile, 10 m | rasterized from `flood_extent/event.shp` |
-| `S1_VV_VH.tif` | 2 (VV, VH) | Sentinel-1 SAR GRD, 10 m | `COPERNICUS/S1_GRD` |
-| `S2_NDVI_NDBI.tif` | 2 (NDVI, NDBI) | Sentinel-2 SR, 10 m | `COPERNICUS/S2_SR_HARMONIZED` |
-| `MERIT.tif` | 4 (elevation, flow dir, UDA, HAND) | MERIT Hydro, 90 m | `MERIT/Hydro/v1_0_1` |
-| `Soil.tif` | 2 (clay, sand) | OpenLandMap SoilGrids, 250 m | `OpenLandMap/SOL/...` |
-| `ESA_WorldCover_PermanentWater.tif` | 1 (permanent water mask) | ESA WorldCover, 10 m | `ESA/WorldCover/v200` |
-| `Precipitation_{first}_{last}.tif` | N (daily, N days pre-event) | GPM-IMERG V07 daily, ~11 km | `NASA/GPM_L3/IMERG_V07` |
-| `SoilMoisture_{first}_{last}.tif` | N (daily, N days pre-event) | SMAP L4 surface SM, ~9 km | `NASA/SMAP/SPL4SMGP/008` |
-
-The seven geospatial layers above are configurable in `scripts/config.py`. `LAYER_TOGGLES` enables or disables each layer, and `N_DAYS_OVERRIDE` sets the daily-series length N per temporal layer (default 30). New GEE layers can be added by copying a template in `scripts/add_gee_layers.py`. `flood_mask.tif` is produced in Step 4 by rasterizing the CEMS delineation. The permanent-water layer (`ESA_WorldCover_PermanentWater.tif`) is exported directly from GEE. That gives 8 GeoTIFFs per event. The temporal layers carry their antecedent window in the filename, for example `Precipitation_20240714_20240812.tif`.
+The seven geospatial layers are configurable in `scripts/config.py`. `LAYER_TOGGLES` enables or disables each layer, and `N_DAYS_OVERRIDE` sets the daily-series length N for the temporal layers (default 30). New GEE layers can be added by copying a template in `scripts/add_gee_layers.py`. The full-scene files keep their own names: `S1_VV_VH.tif`, `S2_NDVI_NDBI.tif`, `MERIT.tif`, `Soil.tif`, `ESA_WorldCover_PermanentWater.tif`, and the temporal layers carry their antecedent window in the filename, for example `Precipitation_20240714_20240812.tif`. `flood_mask.tif` is produced in Step 4 by rasterizing the CEMS delineation.
 
 Each activation supplies two CEMS vector components: the AOI boundary (`aoi/aoi.shp`) and the flood extent (`flood_extent/event.shp`). Permanent water comes from ESA WorldCover, which covers every event.
 
@@ -142,7 +138,9 @@ data/
 
 ## Dataset catalog
 
-`complete_dataset_metadata.csv` has one row per event. Its `folder_name` keys into the patches, GEE_exports, and activations_reorganized folders.
+The released catalog is `complete_dataset_metadata.csv`, one row per event across the whole dataset. Its `folder_name` keys into the patches, GEE_exports, and activations_reorganized folders. A pipeline run does not rewrite it; Step 4 writes only the events new in that run to `4_dataset_metadata.csv` and appends them to the released catalog, so prior events and their assigned splits are preserved.
+
+The columns are below.
 
 | column | description |
 |---|---|
