@@ -2,8 +2,6 @@
 
 The CEMS Multi-Resolution Flood Dataset is a global, machine-learning-ready dataset for flood mapping. It pairs **463,334** co-registered image patches with observed flood extents from **1,553** Copernicus Emergency Management Service (CEMS) flood events, drawn from **188** rapid-mapping activations between 2017 and 2025 and spanning **281** river basins, six continents, and all five Köppen climate zones.
 
-Each patch pairs the observed inundation label with the inputs that govern it. A pre-event precipitation and soil-moisture time series gives the antecedent wetness of the catchment. Sentinel-1 SAR backscatter, Sentinel-2 vegetation and built-up indices, MERIT Hydro terrain, SoilGrids soil texture, and a permanent-water mask give the flood conditioning factors that control runoff generation and accumulation. Every input precedes the flood, so the dataset poses flood **prediction** from antecedent conditions rather than post-event mapping.
-
 | Layer | Source | Native resolution | Bands |
 |---|---|---|---|
 | Sentinel-1 SAR | `COPERNICUS/S1_GRD` | 10 m | VV, VH |
