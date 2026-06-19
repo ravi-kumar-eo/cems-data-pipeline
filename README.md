@@ -2,7 +2,7 @@
 
 The CEMS Multi-Resolution Flood Dataset is a global, machine-learning-ready dataset for flood mapping. It pairs **463,334** co-registered image patches with observed flood extents from **1,553** Copernicus Emergency Management Service (CEMS) flood events, drawn from **188** rapid-mapping activations between 2017 and 2025 and spanning **281** river basins, six continents, and all five Köppen climate zones.
 
-Each patch stacks four co-registered input groups at their native resolutions (10 m to 2.56 km) against a 10 m flood label. Every input is from before the flood, including a 30-day daily series of precipitation and soil moisture leading up to the event, so the dataset poses flood **prediction** from pre-event conditions rather than post-event mapping. The five files of a patch are listed below.
+Each patch carries the conditions a flood depends on: the land surface from Sentinel-1 and Sentinel-2, the terrain that routes water from MERIT Hydro, the soil that absorbs it from SoilGrids, and the antecedent precipitation and soil moisture that drive it. These come as four co-registered input groups at their native resolutions, from 10 m to 2.56 km, paired with the observed flood extent as a 10 m label. Every input is taken before the flood, including the 30 days of daily precipitation and soil moisture leading up to it, so the dataset poses flood **prediction** from pre-event conditions rather than post-event mapping.
 
 The patches ship ready for training with a train, validation, and test split already fixed at HydroBASINS Pfafstetter Level 5, exclusive by basin and by activation so that no basin and no activation crosses splits. The full reproduction pipeline is included, so the release can be rebuilt from scratch or extended to new activations with a Google Earth Engine account.
 
@@ -10,7 +10,7 @@ The patches ship ready for training with a train, validation, and test split alr
 
 ## The patch dataset
 
-Each of the 1,553 flood events is cut into square, non-overlapping 2.56 km tiles. A tile is five co-registered GeoTIFFs: four input groups at their own resolution and the flood label. The daily precipitation and soil moisture cover `N` days before the flood, 30 by default, so the bands below are written in terms of `N`.
+Each event is cut into square, non-overlapping 2.56 km tiles, and each tile is stored as five GeoTIFFs: the four input groups and the flood label. The daily precipitation and soil moisture cover `N` days before the event, 30 by default, so the bands below are written in terms of `N`.
 
 | File | Bands | Pixels | Contents |
 |---|---|---|---|
@@ -20,7 +20,7 @@ Each of the 1,553 flood events is cut into square, non-overlapping 2.56 km tiles
 | `patch_NNNN_input_2560m.tif` | 2N | 1×1 | precipitation (N days) then soil moisture (N days) |
 | `patch_NNNN_flood_mask.tif` | 1 | 256×256 | flood label (1 = flooded) |
 
-With the default `N` of 30, `input_2560m` holds 60 bands: precipitation for days 1–30, then soil moisture for days 1–30. Every file shares the same 2.56 km footprint at its own resolution; the weather layers are coarser than a tile, so `input_2560m` is a single 2.56 km cell.
+With the default `N` of 30, `input_2560m` holds 60 bands: precipitation for days 1 to 30, then soil moisture for days 1 to 30. Every file shares the same 2.56 km footprint at its own resolution. Precipitation and soil moisture are coarser than a tile, so `input_2560m` is a single 2.56 km cell, one value per day.
 
 The flood label is the CEMS flood delineation. Permanent water is a separate input band (band 5 of `input_10m`), taken from ESA WorldCover, so a model can tell pre-existing water from new flooding while the label stays the observed inundation. MERIT flow direction is split into the sine and cosine of its compass angle. The patch index `patch_metadata.csv` lists every tile with its event, bounds, basin, and split.
 
