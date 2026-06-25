@@ -35,7 +35,7 @@ The permanent-water band lets a model tell pre-existing water from new flooding,
 
 ### Patch index and splits
 
-Every patch is listed in `data/metadata/patch_metadata.csv`, one row per tile. The three split files, `train_patches.csv`, `val_patches.csv`, and `test_patches.csv`, are the same table filtered by the `split` column, so each can be loaded directly as a training, validation, or test set. The split is assigned at HydroBASINS Pfafstetter Level 5 and is exclusive by basin and by activation, so no basin and no activation crosses the train, validation, and test sets.
+Every patch is listed in `data/metadata/released_patches_metadata.csv`, one row per tile. The three split files in `data/metadata/split_global/`, `train_patches.csv`, `val_patches.csv`, and `test_patches.csv`, are the same table filtered by the `split` column, so each can be loaded directly as a training, validation, or test set. The split is exclusive by HydroBASINS Pfafstetter Level-5 basin and by whole event, so no basin and no event crosses the train, validation, and test sets. The released split holds 363,634 patches (78.5%) in training, 51,580 (11.1%) in validation, and 48,120 (10.4%) in test.
 
 A tile is addressed by `(emsr_code, folder_name, patch_number)`, which locate its files on disk, so the CSV references patches relationally rather than by absolute path. The key columns are below.
 
@@ -58,7 +58,7 @@ A tile is addressed by `(emsr_code, folder_name, patch_number)`, which locate it
 
 ## Building or extending the dataset
 
-The rest of this README documents the open pipeline that builds the dataset from scratch. Use it to reproduce the release or to extend it to newer activations. The pipeline produces the eight per-event layers of the overview table (the seven geospatial layers plus the flood mask) as full-scene GeoTIFFs, then Step 6 tiles them into the patches described above.
+The rest of this README documents the open pipeline that builds the dataset from scratch. Use it to reproduce the release or to extend it to newer activations. The pipeline produces the eight per-event layers of the overview table (the seven geospatial layers plus the flood mask) as full-scene GeoTIFFs, Step 5 tiles them into the patches described above, and Step 6 assigns the train, validation, and test split.
 
 The seven geospatial layers are configurable in `scripts/config.py`. `LAYER_TOGGLES` enables or disables each layer, and `N_DAYS_OVERRIDE` sets the daily-series length N for the temporal layers (default 30). New GEE layers can be added by copying a template in `scripts/add_gee_layers.py`. The full-scene files keep their own names: `S1_VV_VH.tif`, `S2_NDVI_NDBI.tif`, `MERIT.tif`, `Soil.tif`, `ESA_WorldCover_PermanentWater.tif`, and the temporal layers carry their antecedent window in the filename, for example `Precipitation_20240714_20240812.tif`. `flood_mask.tif` is produced in Step 4 by rasterizing the CEMS delineation.
 
@@ -100,8 +100,9 @@ add_gee_layers.py                Layer registry. Copy a template here to add a c
                                  # wait for GEE tasks to complete (hours)
 3_download_gee_exports.py        Download all EMSR* folders from Google Drive to data/GEE_exports/
 4_gee_output_preprocessing.py    Rasterize flood masks + permanent water + build catalog
-5_create_splits.py               Assign storm/basin-exclusive train/val/test split
-6_make_patches.py                Cut events into model-ready 2.56 km patch tiles
+4b_add_context.py                Add continent, climate, and area columns (downloads a continents layer + Koppen raster on first run)
+5_make_patches.py                Cut events into model-ready 2.56 km patch tiles
+6_make_splits.py                 Assign basin- and event-exclusive train/val/test split (balances by patch count, so runs after patching)
 ```
 
 ```bash
@@ -111,8 +112,9 @@ python scripts/2_submit_gee_tasks.py
 # wait for GEE tasks at code.earthengine.google.com/tasks
 python scripts/3_download_gee_exports.py
 python scripts/4_gee_output_preprocessing.py
-python scripts/5_create_splits.py
-python scripts/6_make_patches.py
+python scripts/4b_add_context.py
+python scripts/5_make_patches.py
+python scripts/6_make_splits.py
 ```
 
 ---
@@ -146,18 +148,23 @@ data/
     1_activation_status.csv         per-product download + reorganization status (Script 1)
     2_gee_export_status.csv         per-layer GEE export status (Script 2)
     4_dataset_metadata.csv          events new in the latest run (Script 4)
-    complete_dataset_metadata.csv   full accumulated dataset catalog (Script 4)
+    released_events_metadata.csv    full accumulated dataset catalog, one row per event (Script 4)
     4_missing_layers_report.csv     missing enabled layers per activation (Script 4)
-    5_split_info.json               split method, counts, exclusivity checks (Script 5)
-    patch_metadata.csv              one row per patch tile (Script 6)
-    6_patch_validation_issues.csv   per-patch QC findings (Script 6)
+    released_patches_metadata.csv   one row per patch tile (Script 5; split added in Script 6)
+    5_patch_validation_issues.csv   per-patch QC findings (Script 5)
+    split_global/
+      train_patches.csv             patch index filtered to the train split (Script 6)
+      val_patches.csv               patch index filtered to the validation split (Script 6)
+      test_patches.csv              patch index filtered to the test split (Script 6)
+  plots/
+    splits/                         split balance plots (Script 6)
 ```
 
 ---
 
 ## Dataset catalog
 
-The released catalog is `complete_dataset_metadata.csv`, one row per event across the whole dataset. Its `folder_name` keys into the patches, GEE_exports, and activations_reorganized folders. A pipeline run does not rewrite it; Step 4 writes only the events new in that run to `4_dataset_metadata.csv` and appends them to the released catalog, so prior events and their assigned splits are preserved.
+The released catalog is `released_events_metadata.csv`, one row per event across the whole dataset. Its `folder_name` keys into the patches, GEE_exports, and activations_reorganized folders. A pipeline run does not rewrite it; Step 4 writes only the events new in that run to `4_dataset_metadata.csv` and appends them to the released catalog, so prior events and their assigned splits are preserved. Step 4b fills the continent, climate, area_km2, and flood_area_km2 columns, and Step 6 fills the split column.
 
 The columns are below.
 

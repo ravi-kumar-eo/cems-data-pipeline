@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
 """
-Script 6: Make patches
+Script 5: Make patches
 
 Cuts each cataloged event's co-registered GeoTIFFs into square, non-overlapping
 patches and writes them as individual GeoTIFFs, then validates every patch.
+The train/val/test split is assigned afterwards in Step 6, which balances by
+patch count and so needs the patches to exist first.
 
 A patch covers PATCH_SIZE_M x PATCH_SIZE_M on the ground (2.56 km by default)
 and is written at four resolutions plus the label, five files in all:
@@ -26,15 +28,15 @@ Input
   data/GEE_exports/{EMSR}/{folder}/  S1_VV_VH, S2_NDVI_NDBI, MERIT, Soil,
                                      ESA_WorldCover_PermanentWater, Precipitation,
                                      SoilMoisture, flood_mask  (all from Steps 2-4)
-  data/metadata/complete_dataset_metadata.csv   the catalog (one row per event)
+  data/metadata/released_events_metadata.csv    the catalog (one row per event)
 
 Output
   data/patches/{EMSR}/{folder}/patch_NNNN_*.tif
-  data/metadata/patch_metadata.csv              one row per patch (+ split, basin)
-  data/metadata/6_patch_validation_issues.csv   QC findings, if any
+  data/metadata/released_patches_metadata.csv    one row per patch (split added in Step 6)
+  data/metadata/5_patch_validation_issues.csv    QC findings, if any
 
 Usage
-  python scripts/6_make_patches.py
+  python scripts/5_make_patches.py
 """
 
 import csv
@@ -376,7 +378,7 @@ def find_gee_folder(folder_name: str) -> Optional[Path]:
 
 def main():
     print("=" * 80)
-    print("  Script 6: Make patches")
+    print("  Script 5: Make patches")
     print(f"  Patch size : {PATCH_SIZE_M} m  ({PX_10M}x{PX_10M} @ 10 m), stride {STRIDE_M} m")
     print(f"  Output     : {PATCHES_DIR}")
     print("=" * 80)
@@ -433,8 +435,9 @@ def main():
                 continue
             meta.update({
                 "emsr_code": emsr, "folder_name": folder_name,
-                "split": row.get("split", ""),
                 "basin_id": row.get("basin_id", ""),
+                "continent": row.get("continent", ""),
+                "climate": row.get("climate", ""),
                 "resolution_class": row.get("resolution_class", ""),
                 "resolution_post_sensor_m": row.get("resolution_post_sensor", ""),
             })
@@ -455,7 +458,7 @@ def main():
             r["patch_index"] = j
         fields = ["patch_index", "emsr_code", "folder_name", "patch_number",
                   "crs", "bounds_minx", "bounds_miny", "bounds_maxx", "bounds_maxy",
-                  "flood_pixels", "basin_id", "split",
+                  "flood_pixels", "basin_id", "continent", "climate",
                   "resolution_post_sensor_m", "resolution_class"]
         with open(PATCH_METADATA_CSV, "w", newline="", encoding="utf-8") as f:
             w = csv.DictWriter(f, fieldnames=fields, extrasaction="ignore")

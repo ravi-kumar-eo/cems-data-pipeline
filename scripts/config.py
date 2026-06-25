@@ -83,6 +83,8 @@ META_DIR            = DATA_DIR / "metadata"
 GEE_EXPORTS_DIR     = DATA_DIR / "GEE_exports"
 ACTIVATIONS_DIR     = DATA_DIR / "activations" / "activations_reorganized"
 HYDROBASINS_DIR     = DATA_DIR / "hydrobasins"
+CONTINENTS_DIR      = DATA_DIR / "continents"   # Natural Earth countries (continent field)
+CLIMATE_DIR         = DATA_DIR / "climate"      # Beck Koppen-Geiger raster
 
 
 # ─── STEP-NUMBERED METADATA FILES ─────────────────────────────────────────────
@@ -98,16 +100,20 @@ CSV_GEE_EXPORT_STATUS   = META_DIR / "2_gee_export_status.csv"   # per-layer exp
 
 # Step 4 — metadata compilation
 CSV_DATASET_METADATA    = META_DIR / "4_dataset_metadata.csv"    # events new in the latest run
-CSV_COMPLETE_METADATA   = META_DIR / "complete_dataset_metadata.csv"  # full accumulated catalog
+CSV_COMPLETE_METADATA   = META_DIR / "released_events_metadata.csv"  # full accumulated catalog (one row per event)
 CSV_MISSING_LAYERS      = META_DIR / "4_missing_layers_report.csv"  # missing enabled layers/event
 
-# Step 5 — splits
-JSON_SPLIT_INFO         = META_DIR / "5_split_info.json"
-
-# Step 6 — patch tiling
+# Step 5 — patch tiling
 PATCHES_DIR             = DATA_DIR / "patches"                       # patch tiles
-CSV_PATCH_METADATA      = META_DIR / "patch_metadata.csv"           # one row per patch
-CSV_PATCH_VALIDATION    = META_DIR / "6_patch_validation_issues.csv"  # QC findings
+CSV_PATCH_METADATA      = META_DIR / "released_patches_metadata.csv"  # one row per patch
+CSV_PATCH_VALIDATION    = META_DIR / "5_patch_validation_issues.csv"  # QC findings
+
+# Step 6 — split generation (runs after patching, balances by patch count)
+SPLIT_DIR               = META_DIR / "split_global"                  # the three split index files
+CSV_TRAIN_PATCHES       = SPLIT_DIR / "train_patches.csv"
+CSV_VAL_PATCHES         = SPLIT_DIR / "val_patches.csv"
+CSV_TEST_PATCHES        = SPLIT_DIR / "test_patches.csv"
+PLOTS_DIR               = DATA_DIR / "plots" / "splits"             # split balance plots
 
 # Map old filenames -> new, for one-time on-disk migration (see migrate_csv_names).
 CSV_MIGRATION = {
@@ -116,7 +122,8 @@ CSV_MIGRATION = {
     "activations.csv":          CSV_ACTIVATION_CATALOG.name,
     "gee_tasks_record.csv":     CSV_GEE_EXPORT_STATUS.name,
     "dataset_metadata.csv":     CSV_DATASET_METADATA.name,
-    "split_info.json":          JSON_SPLIT_INFO.name,
+    "complete_dataset_metadata.csv": CSV_COMPLETE_METADATA.name,
+    "patch_metadata.csv":       CSV_PATCH_METADATA.name,
 }
 
 
