@@ -11,8 +11,24 @@ For each completed GEE export event:
   1. Reorganizes the export folder (flatten, merge GEE tiles, canonical names).
   2. Rasterizes the CEMS flood extent shapefile (flood_extent/event.shp)
      to flood_mask.tif aligned to the S1_VV_VH.tif grid (or any reference layer).
-  3. Assigns HydroBASINS basin ID and region from the AOI centroid.
-  4. Merges sensor metadata and writes the dataset catalog.
+  3. Assigns HydroBASINS basin ID from the AOI centroid.
+  4. Adds geographic + climate context per event:
+       continent          point-in-polygon on a world continents layer
+                          (Natural Earth), nearest-coast fallback, two boundary fixes.
+       climate            Koppen-Geiger main class (A/B/C/D/E), majority class over
+                          the AOI sampled from the Beck et al. (2018) raster.
+       aoi_area_km2       total ground area of the flood_mask footprint, summed over
+                          all pixels with a per-row cos(latitude) ground area.
+       flooded_area_km2   ground area under water, the same per-pixel sum over the
+                          flooded pixels (flood_mask == 1).
+  5. Merges sensor metadata and writes the dataset catalog.
+
+aoi_area_km2 and flooded_area_km2 come from the same flood_mask.tif and the same
+per-pixel area, so flooded_area_km2 <= aoi_area_km2 always holds and both share
+one definition.
+
+The world continents layer and the Koppen raster are not in the repository; they
+are downloaded on first run, the same way HydroBASINS is fetched.
 
 The set of layers checked comes from config.py (enabled layers only), so a
 subset config or a custom temporal length never produces a "failed" event.
@@ -80,6 +96,29 @@ DATASET_METADATA_CSV = config.CSV_DATASET_METADATA
 COMPLETE_METADATA_CSV = config.CSV_COMPLETE_METADATA
 MISSING_LAYERS_CSV   = config.CSV_MISSING_LAYERS
 HYDROBASINS_DIR      = config.HYDROBASINS_DIR
+CONTINENTS_DIR       = config.CONTINENTS_DIR
+CLIMATE_DIR          = config.CLIMATE_DIR
+
+# Natural Earth admin-0 countries (carries a CONTINENT field). ~250 KB.
+NE_URL = ("https://naciscdn.org/naturalearth/110m/cultural/"
+          "ne_110m_admin_0_countries.zip")
+NE_SHP = CONTINENTS_DIR / "ne_110m_admin_0_countries.shp"
+
+# Beck et al. (2018) Koppen-Geiger present-day map at 0.0083 deg (~1 km). ~23 MB
+# tif inside a small zip on Figshare. Cite Beck et al. (2018) when using it.
+KOPPEN_URL = "https://figshare.com/ndownloader/files/12407516"  # Beck_KG_V1.zip
+KOPPEN_TIF = CLIMATE_DIR / "Beck_KG_V1_present_0p0083.tif"
+
+# Natural Earth CONTINENT -> our catalog label.
+NE_CONTINENT = {
+    "Africa": "Africa", "Europe": "Europe", "Asia": "Asia",
+    "North America": "North America", "South America": "South America",
+    "Oceania": "Australia/Oceania",
+}
+
+# Koppen raster value -> main class. A: 1-3, B: 4-7, C: 8-16, D: 17-28, E: 29-30.
+KOPPEN_LABEL = {"A": "A Tropical", "B": "B Arid", "C": "C Temperate",
+                "D": "D Cold", "E": "E Polar"}
 
 # Layer file → expected band count, derived from the ENABLED registry. Used only
 # to REPORT missing layers, never to drop an activation. flood_mask is added
@@ -255,21 +294,6 @@ def classify_resolution(resolution_m: Optional[float]) -> str:
     if resolution_m < 10.0:
         return 'high'
     return 'medium'
-
-
-def detect_region(aoi_shp_path: Path) -> str:
-    """Determine 'europe' or 'rest_of_world' from AOI centroid coordinates."""
-    try:
-        gdf = gpd.read_file(aoi_shp_path)
-        if gdf.crs and gdf.crs.to_epsg() != 4326:
-            gdf = gdf.to_crs(epsg=4326)
-        centroid = gdf.unary_union.centroid
-        # Bounding box: Europe approx -25°W to 45°E, 34°N to 72°N
-        if -25 <= centroid.x <= 45 and 34 <= centroid.y <= 72:
-            return 'europe'
-        return 'rest_of_world'
-    except Exception:
-        return 'unknown'
 
 
 # ─── VALIDATION FUNCTIONS ────────────────────────────────────────────────────
@@ -528,6 +552,155 @@ def rasterize_flood_mask(export_folder: Path, act_folder: Path) -> bool:
         return False
 
 
+# ─── GEOGRAPHIC + CLIMATE CONTEXT ────────────────────────────────────────────
+
+def koppen_main_class(value):
+    v = int(value)
+    if v <= 0:
+        return None
+    if v <= 3:
+        return "A"
+    if v <= 7:
+        return "B"
+    if v <= 16:
+        return "C"
+    if v <= 28:
+        return "D"
+    if v <= 30:
+        return "E"
+    return None
+
+
+def _download(url, dest, what):
+    """
+    Stream a download to a temp file and move it into place only when complete.
+
+    A partial download (interrupted connection, server truncation) otherwise
+    leaves a corrupt file on disk that later poisons every run. We download to
+    {dest}.part, check the byte count against Content-Length when the server
+    sends it, and rename to the final path only on success.
+    """
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    part = dest.with_suffix(dest.suffix + ".part")
+    print(f"    downloading {what} ...", end=" ", flush=True)
+    r = requests.get(url, stream=True, timeout=120)
+    r.raise_for_status()
+    expected = int(r.headers.get("Content-Length", 0))
+    got = 0
+    with open(part, "wb") as f:
+        for chunk in r.iter_content(chunk_size=8192):
+            f.write(chunk)
+            got += len(chunk)
+    if expected and got != expected:
+        part.unlink(missing_ok=True)
+        raise IOError(f"truncated download: got {got} of {expected} bytes")
+    part.replace(dest)
+    print("done")
+
+
+def _download_zip(url, zp, dest_dir, what, attempts=3):
+    """Download a zip and extract it, validating and retrying on a corrupt file."""
+    for attempt in range(1, attempts + 1):
+        try:
+            if zp.exists():
+                # leftover from a prior bad run — re-fetch
+                zp.unlink()
+            _download(url, zp, what)
+            with zipfile.ZipFile(zp) as z:  # raises BadZipFile if truncated
+                z.extractall(dest_dir)
+            return
+        except (zipfile.BadZipFile, IOError) as e:
+            zp.unlink(missing_ok=True)
+            if attempt == attempts:
+                raise
+            print(f"    ! {what} download bad ({e}); retry {attempt + 1}/{attempts}")
+
+
+def ensure_continents():
+    if NE_SHP.exists():
+        return
+    zp = CONTINENTS_DIR / "ne_110m_admin_0_countries.zip"
+    _download_zip(NE_URL, zp, CONTINENTS_DIR, "world continents (Natural Earth)")
+
+
+def ensure_koppen():
+    if KOPPEN_TIF.exists():
+        return
+    zp = CLIMATE_DIR / "Beck_KG_V1.zip"
+    _download_zip(KOPPEN_URL, zp, CLIMATE_DIR, "Koppen-Geiger raster (Beck et al. 2018)")
+    if not KOPPEN_TIF.exists():
+        cand = list(CLIMATE_DIR.glob("*present*0p0083*.tif"))
+        if cand:
+            cand[0].rename(KOPPEN_TIF)
+
+
+def assign_continent(centroid_lonlat, ne) -> Optional[str]:
+    """Point-in-polygon continent, nearest-coast fallback, boundary fixes."""
+    lon, lat = centroid_lonlat
+    pt = gpd.GeoSeries([gpd.points_from_xy([lon], [lat])[0]], crs=4326)
+    hit = gpd.sjoin(gpd.GeoDataFrame(geometry=pt, crs=4326),
+                    ne[["CONTINENT", "geometry"]], how="left", predicate="within")
+    ne_cont = hit["CONTINENT"].iloc[0] if len(hit) else None
+    if pd.isna(ne_cont):
+        # coastal/ocean centroid: nearest country
+        proj = ne.to_crs(3857)
+        p = pt.to_crs(3857).iloc[0]
+        ne_cont = proj.loc[proj.geometry.distance(p).idxmin(), "CONTINENT"]
+    label = NE_CONTINENT.get(ne_cont, ne_cont)
+    # Wallacea / SE-Asian islands south of the equator read as Oceania.
+    if label == "Asia" and lat < -1 and lon >= 120:
+        label = "Australia/Oceania"
+    # European Turkey / Thrace (west of ~30 E, north of 40 N) reads as Europe.
+    if label == "Asia" and lon <= 30 and lat >= 40:
+        label = "Europe"
+    return label
+
+
+def assign_climate(aoi_gdf_4326, koppen) -> Optional[str]:
+    """Majority Koppen main class over the AOI footprint."""
+    from rasterio.mask import mask as rio_mask
+    try:
+        out, _ = rio_mask(koppen, [aoi_gdf_4326.union_all()], crop=True)
+    except Exception:
+        return None
+    vals = out[0][out[0] > 0]
+    if vals.size == 0:
+        return None
+    classes = pd.Series([koppen_main_class(v) for v in vals]).dropna()
+    if classes.empty:
+        return None
+    return KOPPEN_LABEL.get(classes.mode().iat[0])
+
+
+def mask_areas(flood_mask_tif: Path) -> Tuple[Optional[float], Optional[float]]:
+    """
+    Ground area of the flood_mask footprint and of the flooded part, in km2.
+
+    The mask is on a geographic (EPSG:4326) grid, so a pixel's ground size shrinks
+    toward the poles. Each row's pixel area is (res_x * 111320 * cos(lat)) by
+    (res_y * 110540) metres, using that row's latitude. Summing this per-pixel area
+    over all pixels gives aoi_area_km2; summing it over the flooded pixels
+    (mask == 1) gives flooded_area_km2. One source, one formula, so
+    flooded_area_km2 <= aoi_area_km2 always.
+    """
+    try:
+        with rasterio.open(flood_mask_tif) as ds:
+            a = ds.read(1)
+            res_x, res_y = ds.res
+            b = ds.bounds
+            height, width = a.shape
+        # latitude at the centre of each pixel row, top row first
+        lats = np.linspace(b.top - res_y / 2.0, b.bottom + res_y / 2.0, height)
+        dx = res_x * 111320.0 * np.cos(np.radians(lats))  # metres, per row
+        dy = res_y * 110540.0                              # metres
+        px_km2 = dx * dy / 1e6                             # km2 per pixel, per row
+        aoi = float((px_km2 * width).sum())
+        flooded = float(((a == 1).sum(axis=1) * px_km2).sum())
+        return round(aoi, 2), round(flooded, 2)
+    except Exception:
+        return None, None
+
+
 # ─── MAIN ────────────────────────────────────────────────────────────────────
 
 def find_activation_in_exports(folder_name: str) -> Optional[Path]:
@@ -583,6 +756,25 @@ def main():
     except Exception as e:
         print(f"  ! Error loading HydroBASINS: {e}")
         basins_gdf = None
+
+    # Load world continents (Natural Earth) + Koppen-Geiger raster for context
+    print("\n  Loading continents (Natural Earth) + Koppen-Geiger raster...")
+    ne = None
+    koppen = None
+    try:
+        ensure_continents()
+        ne = gpd.read_file(NE_SHP)
+        if ne.crs is None or ne.crs.to_epsg() != 4326:
+            ne = ne.to_crs(4326)
+        print(f"  ✓ Loaded {len(ne)} country polygons")
+    except Exception as e:
+        print(f"  ! Could not load continents: {e} -- continent will be empty")
+    try:
+        ensure_koppen()
+        koppen = rasterio.open(KOPPEN_TIF)
+        print("  ✓ Loaded Koppen-Geiger raster")
+    except Exception as e:
+        print(f"  ! Could not load Koppen raster: {e} -- climate will be empty")
 
     # Load gee_tasks_record.csv
     print("\n[3/6] Loading gee_tasks_record.csv...")
@@ -675,9 +867,7 @@ def main():
                 print(f"  Processed {idx + 1}/{total} events...")
             continue
 
-        # Detect region from AOI shapefile
         aoi_shp = ACTIVATIONS_DIR / emsr_code / folder_name / "aoi" / "aoi.shp"
-        region = detect_region(aoi_shp) if aoi_shp.exists() else 'unknown'
 
         # Get basin ID
         basin_id = 'unknown'
@@ -686,6 +876,26 @@ def main():
             if result:
                 basin_id = result
 
+        # Continent + climate from the AOI footprint
+        continent = climate = None
+        if aoi_shp.exists():
+            try:
+                g = gpd.read_file(aoi_shp)
+                g4 = g.to_crs(4326) if (g.crs and g.crs.to_epsg() != 4326) else g
+                c = g4.union_all().centroid
+                if ne is not None:
+                    continent = assign_continent((c.x, c.y), ne)
+                if koppen is not None:
+                    climate = assign_climate(g4, koppen)
+            except Exception:
+                pass
+
+        # aoi_area_km2 + flooded_area_km2 from the flood_mask raster (one source)
+        aoi_area_km2 = flooded_area_km2 = None
+        mask_tif = export_folder / "flood_mask.tif"
+        if mask_tif.exists():
+            aoi_area_km2, flooded_area_km2 = mask_areas(mask_tif)
+
         # Sensor + resolution info
         sensors = sensor_lookup.get(folder_name, {})
         post_sensors = sensors.get('post_event_sensors', '')
@@ -693,21 +903,25 @@ def main():
 
         catalog_records.append({
             'folder_name': folder_name,
-            'region': region,
             'basin_id': basin_id,
             'pre_event_sensor': sensors.get('pre_event_sensor', ''),
             'post_event_sensors': post_sensors,
             'resolution_post_sensor': res_m if res_m is not None else '',
             'resolution_class': classify_resolution(res_m),
+            'continent': continent if continent is not None else '',
+            'climate': climate if climate is not None else '',
+            'aoi_area_km2': aoi_area_km2 if aoi_area_km2 is not None else '',
+            'flooded_area_km2': flooded_area_km2 if flooded_area_km2 is not None else '',
         })
 
         if (idx + 1) % 100 == 0:
             print(f"  Processed {idx + 1}/{total} activations...")
 
     fieldnames = [
-        'folder_name', 'region', 'basin_id',
+        'folder_name', 'basin_id',
         'pre_event_sensor', 'post_event_sensors',
         'resolution_post_sensor', 'resolution_class',
+        'continent', 'climate', 'aoi_area_km2', 'flooded_area_km2',
     ]
 
     # The complete catalog is the accumulated record of every event ever
