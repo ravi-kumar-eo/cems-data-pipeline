@@ -99,8 +99,7 @@ add_gee_layers.py                Layer registry. Copy a template here to add a c
 2_submit_gee_tasks.py            Submit GEE export tasks to Google Drive (enabled layers per activation)
                                  # wait for GEE tasks to complete (hours)
 3_download_gee_exports.py        Download all EMSR* folders from Google Drive to data/GEE_exports/
-4_gee_output_preprocessing.py    Rasterize flood masks + permanent water + build catalog
-4b_add_context.py                Add continent, climate, and area columns (downloads a continents layer + Koppen raster on first run)
+4_gee_output_preprocessing.py    Rasterize flood masks + permanent water, add continent, climate, and area columns, and build the catalog (downloads a continents layer + Koppen raster on first run)
 5_make_patches.py                Cut events into model-ready 2.56 km patch tiles
 6_make_splits.py                 Assign basin- and event-exclusive train/val/test split (balances by patch count, so runs after patching)
 ```
@@ -112,7 +111,6 @@ python scripts/2_submit_gee_tasks.py
 # wait for GEE tasks at code.earthengine.google.com/tasks
 python scripts/3_download_gee_exports.py
 python scripts/4_gee_output_preprocessing.py
-python scripts/4b_add_context.py
 python scripts/5_make_patches.py
 python scripts/6_make_splits.py
 ```
@@ -164,7 +162,7 @@ data/
 
 ## Dataset catalog
 
-The released catalog is `released_events_metadata.csv`, one row per event across the whole dataset. Its `folder_name` keys into the patches, GEE_exports, and activations_reorganized folders. A pipeline run does not rewrite it; Step 4 writes only the events new in that run to `4_dataset_metadata.csv` and appends them to the released catalog, so prior events and their assigned splits are preserved. Step 4b fills the continent, climate, area_km2, and flood_area_km2 columns, and Step 6 fills the split column.
+The released catalog is `released_events_metadata.csv`, one row per event across the whole dataset. Its `folder_name` keys into the patches, GEE_exports, and activations_reorganized folders. A pipeline run does not rewrite it; Step 4 writes only the events new in that run to `4_dataset_metadata.csv` and appends them to the released catalog, so prior events and their assigned splits are preserved. Step 4 fills the continent, climate, aoi_area_km2, and flooded_area_km2 columns, and Step 6 fills the split column.
 
 The columns are below.
 
@@ -179,5 +177,5 @@ The columns are below.
 | `continent` | continent of the area of interest |
 | `climate` | Köppen-Geiger main class |
 | `split` | train, validation, or test |
-| `area_km2` | area of interest size (km²) |
-| `flood_area_km2` | area under water from the flood polygon (km²) |
+| `aoi_area_km2` | area of interest size (km²) |
+| `flooded_area_km2` | area under water (km²) |
