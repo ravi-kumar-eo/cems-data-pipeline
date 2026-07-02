@@ -32,7 +32,7 @@ the climate mix is fixed by how those components fall.
 
 Input
   data/metadata/released_patches_metadata.csv   one row per patch (from Step 5)
-  data/metadata/released_events_metadata.csv     one row per event (area_km2)
+  data/metadata/released_events_metadata.csv     one row per event (aoi_area_km2)
 
 Output
   data/metadata/released_patches_metadata.csv    `split` column written/updated
@@ -69,8 +69,8 @@ SPLITS = ["train", "val", "test"]
 
 
 # ── EVENT ATTRIBUTES (aggregated from the patches) ───────────────────────────
-def event_size_bin(area_km2):
-    a = float(area_km2) if pd.notna(area_km2) else 0.0
+def event_size_bin(aoi_area_km2):
+    a = float(aoi_area_km2) if pd.notna(aoi_area_km2) else 0.0
     if a < 100:
         return "small<100"
     if a < 1000:
@@ -135,7 +135,7 @@ def assign_splits(df, ev):
     mode = lambda s: s.mode().iat[0]
     e_cont = df.groupby("folder_name")["continent"].agg(mode)
     e_res = df.groupby("folder_name")["resolution_class"].agg(mode)
-    area = ev.set_index("folder_name")["area_km2"].to_dict()
+    area = ev.set_index("folder_name")["aoi_area_km2"].to_dict()
     e_size = {fn: event_size_bin(area.get(fn, np.nan)) for fn in e_npatch.index}
 
     comp_of, comps = build_components(df)
@@ -231,7 +231,7 @@ def make_plots(df, ev):
         print("  matplotlib not installed - skipping balance plots")
         return
     PLOTS_DIR.mkdir(parents=True, exist_ok=True)
-    area = ev.set_index("folder_name")["area_km2"].to_dict()
+    area = ev.set_index("folder_name")["aoi_area_km2"].to_dict()
 
     def sz(fn):
         a = float(area.get(fn, 0)) if pd.notna(area.get(fn, 0)) else 0
@@ -324,7 +324,7 @@ def main():
 
     df = pd.read_csv(PATCH_CSV)
     ev = pd.read_csv(EVENT_CSV) if EVENT_CSV.exists() else pd.DataFrame(
-        columns=["folder_name", "area_km2"])
+        columns=["folder_name", "aoi_area_km2"])
     print(f"  patches={len(df):,}  events(catalog)={len(ev):,}")
 
     ev_split = assign_splits(df, ev)
