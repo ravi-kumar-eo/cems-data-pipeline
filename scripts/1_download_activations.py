@@ -1171,6 +1171,7 @@ class ShapefileFinder:
         # Also search one level deeper (versioned folders like EMSR657_AOI01_..._v1/)
         directory_list += [d for d in directory.iterdir() if d.is_dir()]
 
+        matches = []
         for search_dir in directory_list:
             if not search_dir.is_dir():
                 continue
@@ -1184,8 +1185,24 @@ class ShapefileFinder:
                     continue
                 if require_any and not any(r.lower() in f.stem.lower() for r in require_any):
                     continue
-                return f
-        return None
+                matches.append(f)
+        if not matches:
+            return None
+        # CEMS ships geometry variants as ...A (area), ...P (point), ...L (line),
+        # e.g. observedEventA_v2.shp vs observedEventP_v2.shp. The polygon (A)
+        # variant is the delineation; P and L are annotations (dike breaches etc.)
+        # and must never win over A. Within the same variant prefer the highest
+        # product version (v3 over v2 over v1).
+        def _variant_rank(p: Path) -> int:
+            stem = re.sub(r"(r\d+|v\d+)+$", "", self._norm(p.stem))
+            if stem.endswith("a"):
+                return 0
+            if stem.endswith(("p", "l")):
+                return 2
+            return 1
+        matches.sort(key=lambda p: p.name, reverse=True)   # highest version first
+        matches.sort(key=_variant_rank)                    # stable: A before P/L
+        return matches[0]
 
     def find_aoi(self, product_dir: Path) -> Optional[Path]:
         search = self._search_dir(product_dir)
