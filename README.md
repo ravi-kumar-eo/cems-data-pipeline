@@ -1,6 +1,6 @@
 # CEMS Multi-Resolution Flood Dataset
 
-The CEMS Multi-Resolution Flood Dataset is a global, machine-learning-ready dataset for flood mapping. It pairs **463,334** co-registered image patches with observed flood extents from **1,553** Copernicus Emergency Management Service (CEMS) flood events, drawn from **188** rapid-mapping activations between 2017 and 2025 and spanning **281** river basins, six continents, and all five Köppen climate zones.
+The CEMS Multi-Resolution Flood Dataset is a global, machine-learning-ready dataset for flood mapping. It pairs **527,600** co-registered image patches with observed flood extents from **1,535** Copernicus Emergency Management Service (CEMS) flood events, drawn from **188** rapid-mapping activations between April 2017 and November 2025 and spanning **281** river basins, six continents, and all five Köppen climate zones.
 
 | Layer | Source | Native resolution | Bands |
 |---|---|---|---|
@@ -35,7 +35,7 @@ The permanent-water band lets a model tell pre-existing water from new flooding,
 
 ### Patch index and splits
 
-Every patch is listed in `data/metadata/released_patches_metadata.csv`, one row per tile. The three split files in `data/metadata/split_global/`, `train_patches.csv`, `val_patches.csv`, and `test_patches.csv`, are the same table filtered by the `split` column, so each can be loaded directly as a training, validation, or test set. The split is exclusive by HydroBASINS Pfafstetter Level-5 basin and by whole event, so no basin and no event crosses the train, validation, and test sets. The released split holds 363,634 patches (78.5%) in training, 51,580 (11.1%) in validation, and 48,120 (10.4%) in test.
+Every patch is listed in `released_patches_metadata.csv` in the metadata folder, one row per tile. The three split files in the split_global folder, `train_patches.csv`, `val_patches.csv`, and `test_patches.csv`, are the same table filtered by the `split` column, so each can be loaded directly as a training, validation, or test set. The split is exclusive by HydroBASINS Pfafstetter Level-5 basin and by whole event, so no basin and no event crosses the train, validation, and test sets. The released split contains 417,327 patches (79.1%) from 916 events in training, 57,263 (10.9%) from 277 events in validation, and 53,010 (10.0%) from 342 events in test.
 
 A tile is addressed by `(emsr_code, folder_name, patch_number)`, which locate its files on disk, so the CSV references patches relationally rather than by absolute path. The key columns are below.
 
@@ -47,11 +47,12 @@ A tile is addressed by `(emsr_code, folder_name, patch_number)`, which locate it
 | `patch_number` | index of the tile within its event (the `NNNN` in the filenames) |
 | `crs` | coordinate reference system of the tile (per-event UTM zone) |
 | `bounds_minx/miny/maxx/maxy` | tile footprint bounds in `crs` units (m) |
-| `transform_a..f` | affine geo-transform of the 10 m grid |
-| `resolution_class` | post-event sensor class: medium, high, or very-high |
+| `flood_pixels` | number of flooded pixels in the tile, from the flood mask |
 | `basin_id` | HydroBASINS Pfafstetter Level-5 code(s) of the event |
 | `continent` | continent of the event |
-| `flood_fraction` | fraction of flooded pixels in the tile, from the flood mask |
+| `climate` | Köppen-Geiger main class of the event |
+| `resolution_post_sensor_m` | resolution of the sensor used for the delineation (m) |
+| `resolution_class` | medium, high, or very-high |
 | `split` | train, val, or test |
 
 ---
@@ -60,7 +61,7 @@ A tile is addressed by `(emsr_code, folder_name, patch_number)`, which locate it
 
 The rest of this README documents the open pipeline that builds the dataset from scratch. Use it to reproduce the release or to extend it to newer activations. The pipeline produces the eight per-event layers of the overview table (the seven geospatial layers plus the flood mask) as full-scene GeoTIFFs, Step 5 tiles them into the patches described above, and Step 6 assigns the train, validation, and test split.
 
-The seven geospatial layers are configurable in `scripts/config.py`. `LAYER_TOGGLES` enables or disables each layer, and `N_DAYS_OVERRIDE` sets the daily-series length N for the temporal layers (default 30). New GEE layers can be added by copying a template in `scripts/add_gee_layers.py`. The full-scene files keep their own names: `S1_VV_VH.tif`, `S2_NDVI_NDBI.tif`, `MERIT.tif`, `Soil.tif`, `ESA_WorldCover_PermanentWater.tif`, and the temporal layers carry their antecedent window in the filename, for example `Precipitation_20240714_20240812.tif`. `flood_mask.tif` is produced in Step 4 by rasterizing the CEMS delineation.
+The seven geospatial layers are configurable in `scripts/config.py`. `LAYER_TOGGLES` enables or disables each layer, `N_DAYS_OVERRIDE` sets the daily-series length N for the temporal layers (default 30), and `EXPORT_MODE` selects how Step 2 delivers the layers (see below). New GEE layers can be added by copying a template in `scripts/add_gee_layers.py`. The full-scene files keep their own names: `S1_VV_VH.tif`, `S2_NDVI_NDBI.tif`, `MERIT.tif`, `Soil.tif`, `ESA_WorldCover_PermanentWater.tif`, and the temporal layers carry their antecedent window in the filename, for example `Precipitation_20240714_20240812.tif`. `flood_mask.tif` is produced in Step 4 by rasterizing the CEMS delineation.
 
 Each activation supplies two CEMS vector components: the AOI boundary (`aoi/aoi.shp`) and the flood extent (`flood_extent/event.shp`). Permanent water comes from ESA WorldCover, which covers every event.
 
@@ -79,8 +80,8 @@ pip install -r requirements.txt
 earthengine authenticate
 ```
 
-**Google Drive authentication (once):**  
-Two one-time steps, both per Google Cloud project:
+**Google Drive authentication (once, `drive` mode only):**  
+Skip this if `EXPORT_MODE` is `"direct"`, the default. Two one-time steps, both per Google Cloud project:
 
 1. **Enable the Drive API:** [console.cloud.google.com](https://console.cloud.google.com) → APIs & Services → Enable APIs → search **Google Drive API** → Enable  
    *(Even with credentials.json in place, the API must be explicitly enabled in the project. This is separate from credentials.)*
@@ -93,23 +94,29 @@ First run of Script 3 will open a browser for OAuth approval. The token is saved
 ## Pipeline
 
 ```
-config.py                        Edit first: enable/disable layers, set daily-series length
+config.py                        Edit first: enable/disable layers, set daily-series length, choose the export mode
 add_gee_layers.py                Layer registry. Copy a template here to add a custom GEE layer
 1_download_activations.py        Download EMSR flood activations from Copernicus + reorganize into standardized folders
-2_submit_gee_tasks.py            Submit GEE export tasks to Google Drive (enabled layers per activation)
-                                 # wait for GEE tasks to complete (hours)
-3_download_gee_exports.py        Download all EMSR* folders from Google Drive to data/GEE_exports/
+2_submit_gee_tasks.py            Fetch the enabled layers per activation, direct to disk or as Drive export tasks
+3_download_gee_exports.py        drive mode only: download all EMSR* folders from Google Drive to data/GEE_exports/
 4_gee_output_preprocessing.py    Rasterize flood masks + permanent water, add continent, climate, and area columns, and build the catalog (downloads a continents layer + Koppen raster on first run)
 5_make_patches.py                Cut events into model-ready 2.56 km patch tiles
 6_make_splits.py                 Assign basin- and event-exclusive train/val/test split (balances by patch count, so runs after patching)
 ```
 
+Step 2 delivers the layers in one of two modes, set by `EXPORT_MODE` in `config.py`.
+
+- **`"direct"`** (default) fetches each layer straight into `data/GEE_exports/` in tiled requests. No Google Drive account and no Step 3 are needed, and Step 4 can run as soon as Step 2 finishes. The download runs locally, so the machine stays busy for the length of the batch.
+- **`"drive"`** submits one Earth Engine export task per layer to Google Drive, which Step 3 then downloads. Earth Engine renders the exports on its own servers while nothing runs locally, which suits very large batches, at the cost of the Drive setup and the wait for the task queue.
+
+Both modes write the same files onto the same grid, so the choice does not change the output.
+
 ```bash
 conda activate cems_pipeline
 python scripts/1_download_activations.py
 python scripts/2_submit_gee_tasks.py
-# wait for GEE tasks at code.earthengine.google.com/tasks
-python scripts/3_download_gee_exports.py
+# drive mode only: wait for the tasks at code.earthengine.google.com/tasks, then
+# python scripts/3_download_gee_exports.py
 python scripts/4_gee_output_preprocessing.py
 python scripts/5_make_patches.py
 python scripts/6_make_splits.py
@@ -162,7 +169,7 @@ data/
 
 ## Dataset catalog
 
-The released catalog is `released_events_metadata.csv`, one row per event across the whole dataset. Its `folder_name` keys into the patches, GEE_exports, and activations_reorganized folders. A pipeline run does not rewrite it; Step 4 writes only the events new in that run to `4_dataset_metadata.csv` and appends them to the released catalog, so prior events and their assigned splits are preserved. Step 4 fills the continent, climate, aoi_area_km2, and flooded_area_km2 columns, and Step 6 fills the split column.
+The released catalog is `released_events_metadata.csv`, one row per event across the whole dataset. Its `folder_name` keys into the patches, GEE_exports, and activations_reorganized folders. An activation sometimes maps the same area on the same date more than once, as a delineation, graded, and flood-extent product. Only one of those events is kept, taking the delineation product first, then graded, then flood extent, and within one product type the version with the larger flooded fraction. A pipeline run does not rewrite it; Step 4 writes only the events new in that run to `4_dataset_metadata.csv` and appends them to the released catalog, so prior events and their assigned splits are preserved. Step 4 fills the continent, climate, aoi_area_km2, and flooded_area_km2 columns, and Step 6 fills the split column.
 
 The columns are below.
 
@@ -170,12 +177,12 @@ The columns are below.
 |---|---|
 | `folder_name` | event folder name |
 | `basin_id` | HydroBASINS Pfafstetter Level-5 code(s) |
-| `pre_event_sensor` | sensor of the pre-event reference image |
-| `post_event_sensors` | sensor(s) used for the flood delineation |
-| `resolution_post_sensor` | post-event sensor resolution (m) |
+| `event_sensor` | sensor used for the flood delineation |
+| `resolution_post_sensor` | resolution of that sensor (m) |
 | `resolution_class` | medium, high, or very-high |
 | `continent` | continent of the area of interest |
 | `climate` | Köppen-Geiger main class |
-| `split` | train, validation, or test |
+| `split` | train, val, or test |
 | `aoi_area_km2` | area of interest size (km²) |
 | `flooded_area_km2` | area under water (km²) |
+| `n_patches` | number of patches cut from the event |
