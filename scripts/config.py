@@ -60,6 +60,16 @@ N_DAYS_OVERRIDE: Dict[str, int] = {
 
 TEMPORAL_BUFFER_DEG: float = 0.6
 
+# How Script 2 delivers the layers:
+#   "direct"  download straight from GEE onto disk (tiled getDownloadURL into
+#             data/GEE_exports/). No Drive account needed, no Script 3 — go
+#             straight to Script 4 preprocessing. Runs synchronously, so a big
+#             batch keeps the machine busy while it downloads.
+#   "drive"   the original path: submit Export.image.toDrive tasks, then fetch
+#             the results with Script 3. Better for very large batches because
+#             GEE renders exports server-side while nothing runs locally.
+EXPORT_MODE: str = "direct"
+
 
 # ─── 4. PATCH TILING (Step 6) ─────────────────────────────────────────────────
 # Step 6 cuts each event's co-registered layers into square, non-overlapping
@@ -114,6 +124,22 @@ CSV_TRAIN_PATCHES       = SPLIT_DIR / "train_patches.csv"
 CSV_VAL_PATCHES         = SPLIT_DIR / "val_patches.csv"
 CSV_TEST_PATCHES        = SPLIT_DIR / "test_patches.csv"
 PLOTS_DIR               = DATA_DIR / "plots" / "splits"             # split balance plots
+
+# ─── LOCAL PATH OVERRIDES (optional) ──────────────────────────────────────────
+# To run the pipeline against a data tree outside the repo, create
+# scripts/config_local.py and redefine any of the paths above in it, e.g.
+#
+#     from pathlib import Path
+#     DATA_DIR        = Path("/data/flood")
+#     GEE_EXPORTS_DIR = DATA_DIR / "GEE_exports"
+#
+# The file is gitignored, so machine-specific paths stay out of the repo.
+# Redefine each path you need: they are plain constants, not derived at use time.
+try:
+    from config_local import *  # noqa: F401,F403
+except ImportError:
+    pass
+
 
 # Map old filenames -> new, for one-time on-disk migration (see migrate_csv_names).
 CSV_MIGRATION = {

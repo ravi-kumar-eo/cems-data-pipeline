@@ -39,8 +39,8 @@ Dependencies: requests, beautifulsoup4, PyMuPDF (fitz), urllib3
 """
 
 # ─── CONFIG ──────────────────────────────────────────────────────────────────
-DATE_START = "2026-02-10"   # flood event date range – start (inclusive, YYYY-MM-DD)
-DATE_END   = "2026-02-19"   # flood event date range – end   (inclusive, YYYY-MM-DD)
+DATE_START = "2025-11-01"   # flood event date range – start (inclusive, YYYY-MM-DD)
+DATE_END   = "2026-06-30"   # flood event date range – end   (inclusive, YYYY-MM-DD)
 
 # Activations >= this number use the newer dashboard API for product listing.
 # Older ones are scraped from the HTML activation page.
@@ -48,6 +48,11 @@ API_THRESHOLD = 656
 
 # Seconds to wait between web requests (be polite to Copernicus servers)
 REQUEST_DELAY = 1.5
+
+# Transient-failure retries for product ZIP downloads.
+# Backoff must have at least DOWNLOAD_ATTEMPTS - 1 entries.
+DOWNLOAD_ATTEMPTS  = 3
+DOWNLOAD_BACKOFF_S = [5, 15, 45]
 
 # Shapefile component extensions to copy into standardized folders
 SHAPEFILE_EXTENSIONS = ['.shp', '.shx', '.dbf', '.prj', '.cpg',
@@ -74,11 +79,14 @@ from bs4 import BeautifulSoup
 # ─── LOGGING SETUP ───────────────────────────────────────────────────────────
 
 class _Tee:
-    """Mirror stdout to a log file simultaneously."""
-    def __init__(self, log_path: Path):
-        log_path.parent.mkdir(parents=True, exist_ok=True)
-        self._file = open(log_path, "w", encoding="utf-8", buffering=1)
-        self._stdout = sys.stdout
+    """Mirror a stream (stdout or stderr) to a shared log file simultaneously."""
+    def __init__(self, log_path: Path = None, stream=None, file=None):
+        if file is None:
+            log_path.parent.mkdir(parents=True, exist_ok=True)
+            file = open(log_path, "w", encoding="utf-8", buffering=1)
+        self._file   = file
+        self._stdout = stream if stream is not None else sys.stdout
+        self._err_tee = None
     def write(self, msg):
         self._stdout.write(msg)
         self._file.write(msg)
@@ -87,13 +95,18 @@ class _Tee:
         self._file.flush()
     def close(self):
         sys.stdout = self._stdout
+        if self._err_tee is not None:
+            sys.stderr = self._err_tee._stdout
         self._file.close()
 
 def _setup_logging() -> _Tee:
     logs_dir = Path(__file__).resolve().parent / "logs"
     log_path  = logs_dir / f"1_download_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
     tee = _Tee(log_path)
+    # stderr shares the same file, so tracebacks and warnings land in the log too
+    tee._err_tee = _Tee(stream=sys.stderr, file=tee._file)
     sys.stdout = tee
+    sys.stderr = tee._err_tee
     print(f"Log: {log_path}")
     return tee
 
@@ -149,7 +162,11 @@ class StatusTracker:
             reader = csv.DictReader(f)
             for row in reader:
                 key = (row["emsr_code"], row["product_folder"])
-                self._data[key] = row
+                # Drop columns from an older schema (e.g. has_hydro, dcc_folder)
+                # so the in-memory table always matches STATUS_FIELDS. Extras are
+                # only ever legitimate coming from a file; a record built in code
+                # with an unknown key is a typo, and stays a hard error.
+                self._data[key] = {f: row.get(f, "") for f in STATUS_FIELDS}
 
     def get(self, emsr_code: str, product_folder: str) -> Optional[Dict]:
         return self._data.get((emsr_code, product_folder))
@@ -169,7 +186,11 @@ class StatusTracker:
     def _flush(self):
         self.csv_path.parent.mkdir(parents=True, exist_ok=True)
         with open(self.csv_path, "w", newline="", encoding="utf-8") as f:
-            writer = csv.DictWriter(f, fieldnames=STATUS_FIELDS)
+            # extrasaction="ignore": a row carrying columns from an older schema
+            # (e.g. has_hydro, dcc_folder) is written without them instead of
+            # raising mid-write, which would leave this file truncated.
+            writer = csv.DictWriter(f, fieldnames=STATUS_FIELDS,
+                                    extrasaction="ignore")
             writer.writeheader()
             for row in self._data.values():
                 writer.writerow(row)
@@ -350,21 +371,41 @@ class EMSRDownloader:
     # ── internal helpers ──────────────────────────────────────────────────
 
     def _download_file(self, url: str, dest: Path) -> bool:
-        """Stream-download url → dest.  Returns True on success."""
+        """
+        Stream-download url → dest.  Returns True on success.
+
+        Copernicus drops large transfers mid-stream (BrokenPipeError) and its
+        gateway intermittently answers 502, so a single attempt loses products
+        that are perfectly downloadable seconds later. Retry with backoff; a
+        genuine 404 is not retried.
+        """
         dest.parent.mkdir(parents=True, exist_ok=True)
-        try:
-            r = self.session.get(url, stream=True, timeout=60, verify=False)
-            r.raise_for_status()
-            with open(dest, "wb") as f:
-                for chunk in r.iter_content(chunk_size=65536):
-                    if chunk:
-                        f.write(chunk)
-            return True
-        except Exception as e:
-            print(f"        ✗ Download failed: {e}")
-            if dest.exists():
-                dest.unlink()
-            return False
+        for attempt in range(1, DOWNLOAD_ATTEMPTS + 1):
+            try:
+                r = self.session.get(url, stream=True, timeout=60, verify=False)
+                r.raise_for_status()
+                with open(dest, "wb") as f:
+                    for chunk in r.iter_content(chunk_size=65536):
+                        if chunk:
+                            f.write(chunk)
+                if attempt > 1:
+                    print(f"        ✓ succeeded on attempt {attempt}")
+                return True
+            except Exception as e:
+                if dest.exists():
+                    dest.unlink()
+                status = getattr(getattr(e, "response", None), "status_code", None)
+                if status in (403, 404):
+                    print(f"        ✗ Download failed ({status}, not retrying): {e}")
+                    return False
+                if attempt == DOWNLOAD_ATTEMPTS:
+                    print(f"        ✗ Download failed after {attempt} attempts: {e}")
+                    return False
+                wait = DOWNLOAD_BACKOFF_S[attempt - 1]
+                print(f"        ⟳ attempt {attempt}/{DOWNLOAD_ATTEMPTS} failed "
+                      f"({e}) — retrying in {wait}s")
+                time.sleep(wait)
+        return False
 
     def _extract_zip(self, zip_path: Path, dest: Path) -> bool:
         try:
@@ -633,13 +674,17 @@ class EMSRDownloader:
 
     def get_products(self, code: str) -> List[Dict]:
         """Return list of products for this activation (API or HTML method)."""
-        if _emsr_num(code) >= API_THRESHOLD:
+        num = _emsr_num(code)
+        if num is None:
+            print(f"      not a rapid-mapping (EMSR) code — skipping {code}")
+            return []
+        if num >= API_THRESHOLD:
             return self._get_products_api(code)
         return self._get_products_html(code)
 
     def download_product(self, code: str, product: Dict,
                           activation_raw_dir: Path) -> bool:
-        if _emsr_num(code) >= API_THRESHOLD:
+        if (_emsr_num(code) or 0) >= API_THRESHOLD:
             return self._download_api_product(code, product, activation_raw_dir)
         return self._download_html_product(code, product, activation_raw_dir)
 
@@ -1316,6 +1361,7 @@ def fetch_flood_codes_by_date(date_start: str, date_end: str) -> List[Dict]:
     session.headers.update({"User-Agent": "Mozilla/5.0"})
 
     results  = []
+    skipped_non_emsr: List[str] = []
     url      = f"{API_URL}?ordering=activationTime&limit=100"
 
     print("  Fetching activation list from Copernicus ...", end=" ", flush=True)
@@ -1341,6 +1387,13 @@ def fetch_flood_codes_by_date(date_start: str, date_end: str) -> List[Dict]:
             if act_date < date_start or act_date > date_end:
                 continue
 
+            # Only rapid-mapping (EMSR) activations ship delineation products.
+            # Risk & Recovery (EMSN) activations use a different product model
+            # and have no EMSR number, so the downloader cannot handle them.
+            if _emsr_num(act["code"]) is None:
+                skipped_non_emsr.append(f"{act['code']} ({act_date})")
+                continue
+
             countries = [c.get("short_name", c) if isinstance(c, dict) else c
                          for c in act.get("countries", [])]
             results.append({
@@ -1355,6 +1408,9 @@ def fetch_flood_codes_by_date(date_start: str, date_end: str) -> List[Dict]:
         url = data.get("next")
 
     print(f"done ({page} pages)")
+    if skipped_non_emsr:
+        print(f"  Skipped {len(skipped_non_emsr)} non-rapid-mapping flood "
+              f"activations: {', '.join(skipped_non_emsr)}")
     return results
 
 

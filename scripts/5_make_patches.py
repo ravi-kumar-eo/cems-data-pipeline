@@ -2,8 +2,9 @@
 """
 Script 5: Make patches
 
-Cuts each cataloged event's co-registered GeoTIFFs into square, non-overlapping
-patches and writes them as individual GeoTIFFs, then validates every patch.
+Cuts each cataloged event's co-registered GeoTIFFs into square patches
+(STRIDE_M controls the overlap between neighbours; STRIDE_M = PATCH_SIZE_M
+means none) and writes them as individual GeoTIFFs, then validates every patch.
 The train/val/test split is assigned afterwards in Step 6, which balances by
 patch count and so needs the patches to exist first.
 
@@ -276,7 +277,11 @@ def patch_grid(width, height) -> List[Tuple[int, int]]:
 
 
 def has_valid_data(patch) -> bool:
-    return (np.sum(patch != NODATA) / patch.size) >= MIN_VALID_RATIO
+    # Judge validity on the 4 data bands only (S1 VV/VH, NDVI, NDBI): the
+    # permanent-water band is always written 0/1, never nodata, so including
+    # it would make every patch look >=20% valid and the filter never fire.
+    data = patch[:4]
+    return (np.sum(data != NODATA) / data.size) >= MIN_VALID_RATIO
 
 
 def write_patch(stacks, transforms, ref_crs, idx, r10, c10, out_dir) -> Optional[Dict]:
@@ -376,6 +381,22 @@ def find_gee_folder(folder_name: str) -> Optional[Path]:
     return p if p.exists() else None
 
 
+META_FIELDS  = ["patch_index", "emsr_code", "folder_name", "patch_number",
+                "crs", "bounds_minx", "bounds_miny", "bounds_maxx", "bounds_maxy",
+                "flood_pixels", "basin_id", "continent", "climate",
+                "resolution_post_sensor_m", "resolution_class"]
+ISSUE_FIELDS = ["emsr_code", "folder_name", "patch", "file", "check", "detail"]
+
+
+def _append_csv(path: Path, fields: List[str], rows: List[Dict]) -> None:
+    new = not path.exists()
+    with open(path, "a", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=fields, extrasaction="ignore")
+        if new:
+            w.writeheader()
+        w.writerows(rows)
+
+
 def main():
     print("=" * 80)
     print("  Script 5: Make patches")
@@ -394,9 +415,22 @@ def main():
     print(f"\nCataloged events: {len(catalog)}")
 
     META_DIR.mkdir(parents=True, exist_ok=True)
-    patch_rows: List[Dict] = []
-    all_issues: List[Dict] = []
-    n_events = n_patches = 0
+    PATCH_METADATA_CSV.parent.mkdir(parents=True, exist_ok=True)
+
+    # Resume from the metadata CSV: an event counts as done only once its rows
+    # are recorded there (appended after all its patches are written), so a
+    # crash mid-event redoes that event instead of leaving it half-patched.
+    done_events = set()
+    next_index = 0
+    if PATCH_METADATA_CSV.exists():
+        with open(PATCH_METADATA_CSV, newline="", encoding="utf-8") as f:
+            for r in csv.DictReader(f):
+                done_events.add(r["folder_name"])
+                next_index += 1
+    if done_events:
+        print(f"Resuming: {len(done_events)} events already in {PATCH_METADATA_CSV.name}")
+
+    n_events = n_patches = n_issues = 0
 
     for i, row in enumerate(catalog, 1):
         folder_name = row["folder_name"]
@@ -407,7 +441,7 @@ def main():
             continue
 
         out_dir = PATCHES_DIR / emsr / folder_name
-        if out_dir.exists() and list(out_dir.glob("patch_0000_*")):
+        if folder_name in done_events:
             print(f"[{i}/{len(catalog)}] {folder_name}  -- already done, skipped")
             continue
 
@@ -428,7 +462,8 @@ def main():
         transforms = (t10, t80, t160, t2560, tmask)
 
         grid = patch_grid(s10.shape[2], s10.shape[1])
-        saved = 0
+        event_rows: List[Dict] = []
+        event_issues: List[Dict] = []
         for idx, (r10, c10) in enumerate(grid):
             meta = write_patch(stacks, transforms, ref_crs, idx, r10, c10, out_dir)
             if meta is None:
@@ -443,41 +478,27 @@ def main():
             })
             for iss in validate_patch(out_dir, idx):
                 iss.update({"emsr_code": emsr, "folder_name": folder_name})
-                all_issues.append(iss)
-            patch_rows.append(meta)
-            saved += 1
+                event_issues.append(iss)
+            meta["patch_index"] = next_index
+            next_index += 1
+            event_rows.append(meta)
+
+        # Append this event's rows only after every patch is on disk: the CSV
+        # is the resume marker, so a crash before this line redoes the event.
+        _append_csv(PATCH_METADATA_CSV, META_FIELDS, event_rows)
+        if event_issues:
+            _append_csv(VALIDATION_CSV, ISSUE_FIELDS, event_issues)
 
         n_events += 1
-        n_patches += saved
-        print(f"[{i}/{len(catalog)}] {folder_name}  -- {saved}/{len(grid)} patches "
-              f"[{time.time() - t0:.0f}s]")
-
-    # ── write patch metadata ──────────────────────────────────────────────────
-    if patch_rows:
-        for j, r in enumerate(patch_rows):
-            r["patch_index"] = j
-        fields = ["patch_index", "emsr_code", "folder_name", "patch_number",
-                  "crs", "bounds_minx", "bounds_miny", "bounds_maxx", "bounds_maxy",
-                  "flood_pixels", "basin_id", "continent", "climate",
-                  "resolution_post_sensor_m", "resolution_class"]
-        with open(PATCH_METADATA_CSV, "w", newline="", encoding="utf-8") as f:
-            w = csv.DictWriter(f, fieldnames=fields, extrasaction="ignore")
-            w.writeheader()
-            w.writerows(patch_rows)
-        print(f"\n  Wrote {PATCH_METADATA_CSV} ({len(patch_rows)} patches)")
-
-    if all_issues:
-        with open(VALIDATION_CSV, "w", newline="", encoding="utf-8") as f:
-            w = csv.DictWriter(
-                f, fieldnames=["emsr_code", "folder_name", "patch", "file", "check", "detail"],
-                extrasaction="ignore")
-            w.writeheader()
-            w.writerows(all_issues)
-        print(f"  Wrote {VALIDATION_CSV} ({len(all_issues)} issues)")
+        n_patches += len(event_rows)
+        n_issues += len(event_issues)
+        print(f"[{i}/{len(catalog)}] {folder_name}  -- {len(event_rows)}/{len(grid)} patches "
+              f"[{time.time() - t0:.0f}s]", flush=True)
 
     print("\n" + "=" * 80)
     print(f"DONE  events={n_events}  patches={n_patches}  "
-          f"validation_issues={len(all_issues)}")
+          f"validation_issues={n_issues}")
+    print(f"  metadata: {PATCH_METADATA_CSV} ({next_index} patches total)")
     print("=" * 80)
 
 

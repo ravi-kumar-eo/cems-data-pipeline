@@ -2,8 +2,12 @@
 """
 Script 2: Submit GEE Export Tasks for Flood Activations
 
-For each activation in data/activations/ (output of Script 1), this
-script submits Google Earth Engine export tasks to Google Drive.
+For each activation in data/activations/ (output of Script 1), this script
+delivers the GEE layers. Two modes (config.EXPORT_MODE):
+  "direct" (default) — downloads each layer straight from GEE into
+      data/GEE_exports/{activation}/ (tiled getDownloadURL, no Drive, no
+      Script 3); continue directly with Script 4 preprocessing.
+  "drive" — submits Export.image.toDrive tasks; fetch results with Script 3.
 
 7 multi-band GeoTIFFs per activation (7 GEE tasks):
   S1_VV_VH.tif        2 bands   Sentinel-1 VV/VH median composite (30-90 days pre-event)
@@ -137,6 +141,11 @@ from typing import Dict, List, Optional, Tuple
 
 import config
 from config import enabled_layers, enabled_keys
+import gee_direct
+
+# Direct-mode output dir: same place Script 3 would download to, so Script 4
+# preprocessing picks the files up unchanged whichever mode produced them.
+GEE_EXPORTS_LOCAL = config.DATA_DIR / "GEE_exports"
 
 try:
     import ee
@@ -316,11 +325,39 @@ def _gee_region(minx: float, miny: float, maxx: float, maxy: float):
 
 
 def _submit(image, description: str, file_prefix: str,
-            region, crs_transform: list, act_name: str, layer: str) -> bool:
+            region, crs_transform: list, act_name: str, layer: str,
+            bounds4: tuple = None, pixel: float = None) -> bool:
     """
-    Submit one GEE export task.
+    Deliver one layer, honouring config.EXPORT_MODE:
+      "direct"  download it now onto data/GEE_exports/{activation}/ with the
+                same grid the Drive export would have used (see gee_direct.py);
+      "drive"   submit an Export.image.toDrive task (fetch later via Script 3).
+    bounds4/pixel are the snapped bbox and pixel size behind crs_transform;
+    direct mode needs them to size the output raster.
     Returns True on success.
     """
+    if config.EXPORT_MODE == "direct":
+        # nested {EMSR_code}/{activation}/ layout — what Script 4 iterates
+        out_dir = GEE_EXPORTS_LOCAL / act_name.split("_")[0] / act_name
+        out_path = out_dir / f"{file_prefix.split('/', 1)[1]}.tif"
+        # skip when the layer is already there — raw name from a previous direct
+        # run, or the canonical name Script 4 renames to (Drive-era folders)
+        canonical = {"S1": ["S1_VV_VH.tif"],
+                     "S2_indices": ["land_cover.tif", "S2_NDVI_NDBI.tif"],
+                     "ESA_PW": ["ESA_WorldCover_PermanentWater.tif"]}
+        existing = [out_path] + [out_dir / c for c in canonical.get(layer, [])]
+        hit = next((p for p in existing if p.exists()), None)
+        if hit is not None:
+            print(f"        ✓ exists, skip ({hit.name})")
+            return True
+        w, h = gee_direct.dims_from_bounds(*bounds4, pixel)
+        t0 = time.time()
+        ok = gee_direct.download_image(image, crs_transform, w, h, out_path)
+        if ok:
+            print(f"        ✓ downloaded {out_path.name} "
+                  f"({w}x{h}, {time.time()-t0:.0f}s)")
+        return ok
+
     # GEE description must be ≤100 chars and unique-ish
     short_desc = description[:100]
     # Each activation gets its own folder in Google Drive
@@ -970,7 +1007,8 @@ def submit_for_activation(act_folder: Path, download_tracker: DownloadTracker) -
                 print(f"        ✗ Marked as NA (no images available)")
                 download_tracker.mark_layer_na(emsr_code, act_name, key)
                 continue
-            ok = _submit(img, desc(key), prefix(key), region, crs_tf, act_name, key)
+            ok = _submit(img, desc(key), prefix(key), region, crs_tf, act_name, key,
+                         bounds4=(minx, miny, maxx, maxy), pixel=PIXEL_DEG)
 
         elif spec.kind == "temporal":
             deg = TEMPORAL_DEG.get(key, spec.resolution_m / 111000.0)
@@ -983,7 +1021,8 @@ def submit_for_activation(act_folder: Path, download_tracker: DownloadTracker) -
             first_day = (event_date - timedelta(days=spec.n_days)).strftime("%Y%m%d")
             last_day  = (event_date - timedelta(days=1)).strftime("%Y%m%d")
             dated = f"{spec.filename[:-4]}_{first_day}_{last_day}"
-            ok = _submit(img, desc(dated), prefix(dated), t_region, t_tf, act_name, key)
+            ok = _submit(img, desc(dated), prefix(dated), t_region, t_tf, act_name, key,
+                         bounds4=(t_minx, t_miny, t_maxx, t_maxy), pixel=deg)
 
         else:  # static
             img = spec.builder(region)
@@ -991,15 +1030,27 @@ def submit_for_activation(act_folder: Path, download_tracker: DownloadTracker) -
             # same AOI footprint. ESA_PW (10 m) lands on the fine reference grid;
             # MERIT (90 m) and SoilGrids (250 m) keep their coarse native pixels.
             if abs(spec.resolution_m - 10.0) < 1e-6:
-                ok = _submit(img, desc(key), prefix(key), region, crs_tf, act_name, key)
+                ok = _submit(img, desc(key), prefix(key), region, crs_tf, act_name, key,
+                             bounds4=(minx, miny, maxx, maxy), pixel=PIXEL_DEG)
             else:
                 deg = spec.resolution_m / 111000.0
                 s_minx, s_miny, s_maxx, s_maxy, s_tf = _snap_bounds(*bounds, deg)
                 s_region = _gee_region(s_minx, s_miny, s_maxx, s_maxy)
-                ok = _submit(img, desc(key), prefix(key), s_region, s_tf, act_name, key)
+                ok = _submit(img, desc(key), prefix(key), s_region, s_tf, act_name, key,
+                             bounds4=(s_minx, s_miny, s_maxx, s_maxy), pixel=deg)
+
+        if ok and config.EXPORT_MODE == "direct":
+            # file is already on disk and validated grid-wise; record it so
+            # needs_submission() skips it on the next run
+            rec = download_tracker.get(act_name) or {
+                'EMSR_code': emsr_code, 'folder_name': act_name,
+                **{k: "no" for k in ALL_LAYERS}}
+            rec[key] = "yes"
+            download_tracker.upsert(rec)
 
         submitted += int(ok)
-        time.sleep(REQUEST_DELAY)
+        if config.EXPORT_MODE != "direct":
+            time.sleep(REQUEST_DELAY)
 
     return submitted
 
@@ -1135,11 +1186,15 @@ def main():
         print("  Note: Activations with 'NA' status in any layer are skipped")
         print("        (NA = no GEE images available for that layer)")
         print()
-        print("  Next steps after GEE tasks complete:")
-        print(f"    1. Download activation folders from Google Drive")
-        print(f"       Each activation has its own folder (e.g., EMSR123_AOI01_...)")
-        print(f"       Inside each folder: S1_VV_VH.tif, land_cover.tif, MERIT.tif, etc.")
-        print(f"    2. Run Script 4 to validate exports, then Script 5 to process downloads → patches")
+        if config.EXPORT_MODE == "direct":
+            print("  Layers were downloaded directly to data/GEE_exports/.")
+            print("  Next: run Script 4 to validate/preprocess, then Script 5 → patches")
+        else:
+            print("  Next steps after GEE tasks complete:")
+            print(f"    1. Download activation folders from Google Drive (Script 3)")
+            print(f"       Each activation has its own folder (e.g., EMSR123_AOI01_...)")
+            print(f"       Inside each folder: S1_VV_VH.tif, land_cover.tif, MERIT.tif, etc.")
+            print(f"    2. Run Script 4 to validate exports, then Script 5 to process downloads → patches")
         print("=" * 72)
 
     # ── Update Download Tracking CSV ──────────────────────────────────────
