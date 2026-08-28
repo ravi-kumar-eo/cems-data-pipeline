@@ -39,8 +39,8 @@ Dependencies: requests, beautifulsoup4, PyMuPDF (fitz), urllib3
 """
 
 # ─── CONFIG ──────────────────────────────────────────────────────────────────
-DATE_START = "2025-11-01"   # flood event date range – start (inclusive, YYYY-MM-DD)
-DATE_END   = "2026-06-30"   # flood event date range – end   (inclusive, YYYY-MM-DD)
+DATE_START = "2026-02-15"   # TEST: window with real floods
+DATE_END   = "2026-04-30"   # TEST
 
 # Activations >= this number use the newer dashboard API for product listing.
 # Older ones are scraped from the HTML activation page.
@@ -121,15 +121,17 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 # ─── PATH SETUP ──────────────────────────────────────────────────────────────
 
-BASE_DIR    = Path(__file__).resolve().parent.parent   # repo root
-DATA_DIR    = BASE_DIR / "data"
-META_DIR    = DATA_DIR / "metadata"
-ACTIVATIONS = DATA_DIR / "activations"
-RAW_DIR     = ACTIVATIONS / "activations_raw"
-ACT_DIR     = ACTIVATIONS / "activations_reorganized"
-TEMP_DIR    = DATA_DIR / "_temp"
-
+# Every path comes from config.py, so a scripts/config_local.py override
+# redirects this script's outputs together with the rest of the pipeline.
 import config
+
+BASE_DIR    = config.BASE_DIR                 # repo root
+DATA_DIR    = config.DATA_DIR
+META_DIR    = config.META_DIR
+RAW_DIR     = config.ACTIVATIONS_RAW_DIR      # raw Copernicus downloads
+ACT_DIR     = config.ACTIVATIONS_DIR          # standardized aoi/ + flood_extent/ folders
+TEMP_DIR    = config.TEMP_DIR
+
 STATUS_CSV  = config.CSV_ACTIVATION_STATUS    # 1_activation_status.csv (resume state)
 CATALOG_CSV = config.CSV_ACTIVATION_CATALOG   # 1_activation_catalog.csv (output catalog)
 

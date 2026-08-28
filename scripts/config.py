@@ -91,10 +91,16 @@ BASE_DIR            = Path(__file__).resolve().parent.parent
 DATA_DIR            = BASE_DIR / "data"
 META_DIR            = DATA_DIR / "metadata"
 GEE_EXPORTS_DIR     = DATA_DIR / "GEE_exports"
+ACTIVATIONS_RAW_DIR = DATA_DIR / "activations" / "activations_raw"        # Step 1 raw downloads
 ACTIVATIONS_DIR     = DATA_DIR / "activations" / "activations_reorganized"
+TEMP_DIR            = DATA_DIR / "_temp"        # Step 1 scratch space for product ZIPs
 HYDROBASINS_DIR     = DATA_DIR / "hydrobasins"
 CONTINENTS_DIR      = DATA_DIR / "continents"   # Natural Earth countries (continent field)
 CLIMATE_DIR         = DATA_DIR / "climate"      # Beck Koppen-Geiger raster
+
+# Step 3 (drive mode only) — Google Drive OAuth
+GDRIVE_TOKEN_FILE   = DATA_DIR / ".gdrive_token.json"
+GDRIVE_CREDS_DIR    = BASE_DIR / "Gdrive_credentials"
 
 
 # ─── STEP-NUMBERED METADATA FILES ─────────────────────────────────────────────
@@ -107,6 +113,11 @@ CSV_ACTIVATION_CATALOG  = META_DIR / "1_activation_catalog.csv"  # first-draft c
 
 # Step 2 — GEE export submission
 CSV_GEE_EXPORT_STATUS   = META_DIR / "2_gee_export_status.csv"   # per-layer export status
+# Provenance of the S1/S2 median composites: which acquisition window, cloud
+# threshold and image count each exported composite was actually built from.
+# Not needed by any later step — kept so a released composite can be traced
+# back to its source imagery.
+CSV_COMPOSITE_REGISTRY  = META_DIR / "2_composite_registry.csv"
 
 # Step 4 — metadata compilation
 CSV_DATASET_METADATA    = META_DIR / "4_dataset_metadata.csv"    # events new in the latest run
@@ -127,18 +138,90 @@ PLOTS_DIR               = DATA_DIR / "plots" / "splits"             # split bala
 
 # ─── LOCAL PATH OVERRIDES (optional) ──────────────────────────────────────────
 # To run the pipeline against a data tree outside the repo, create
-# scripts/config_local.py and redefine any of the paths above in it, e.g.
+# scripts/config_local.py and redefine any of the paths above in it. Setting
+# DATA_DIR alone is enough — every directory and CSV below it is rebuilt from
+# the new root afterwards:
+#
+#     from pathlib import Path
+#     DATA_DIR = Path("/data/flood")
+#
+# To move one thing on its own, name it explicitly and it is kept as given:
 #
 #     from pathlib import Path
 #     DATA_DIR        = Path("/data/flood")
-#     GEE_EXPORTS_DIR = DATA_DIR / "GEE_exports"
+#     GEE_EXPORTS_DIR = Path("/mnt/bigdisk/GEE_exports")   # elsewhere
 #
 # The file is gitignored, so machine-specific paths stay out of the repo.
-# Redefine each path you need: they are plain constants, not derived at use time.
+_DEFAULTS = dict(vars())          # snapshot of the repo defaults, before override
+
+# Which names config_local actually assigns, read from the module itself rather
+# than inferred by comparing values — a user who deliberately pins a path to the
+# same value as the default must still have that treated as an explicit choice.
+_LOCAL_NAMES: set = set()
 try:
+    import config_local as _cl
+    _LOCAL_NAMES = {n for n in vars(_cl) if not n.startswith("_")}
     from config_local import *  # noqa: F401,F403
+    _HAS_LOCAL = True
 except ImportError:
-    pass
+    _HAS_LOCAL = False
+
+
+def _rebase_derived_paths() -> None:
+    """
+    Re-derive every path under DATA_DIR after a config_local override.
+
+    Paths here are plain module constants, computed at import time, so a
+    config_local that sets only DATA_DIR would otherwise leave all of them
+    pointing at the old root — the whole pipeline would keep writing to
+    data/ while the user believed it had moved. Anything config_local names
+    explicitly is left exactly as given.
+    """
+    g = globals()
+    if not _HAS_LOCAL or "DATA_DIR" not in _LOCAL_NAMES:
+        return
+
+    base = g["DATA_DIR"]
+    meta = g["META_DIR"] if "META_DIR" in _LOCAL_NAMES else base / "metadata"
+
+    derived = {
+        "META_DIR":            meta,
+        "GEE_EXPORTS_DIR":     base / "GEE_exports",
+        "ACTIVATIONS_RAW_DIR": base / "activations" / "activations_raw",
+        "ACTIVATIONS_DIR":     base / "activations" / "activations_reorganized",
+        "TEMP_DIR":            base / "_temp",
+        "HYDROBASINS_DIR":     base / "hydrobasins",
+        "CONTINENTS_DIR":      base / "continents",
+        "CLIMATE_DIR":         base / "climate",
+        "GDRIVE_TOKEN_FILE":   base / ".gdrive_token.json",
+        "PATCHES_DIR":         base / "patches",
+        "PLOTS_DIR":           base / "plots" / "splits",
+        "SPLIT_DIR":           meta / "split_global",
+        "CSV_ACTIVATION_STATUS":  meta / "1_activation_status.csv",
+        "CSV_ACTIVATION_SENSORS": meta / "1_activation_sensors.csv",
+        "CSV_ACTIVATION_CATALOG": meta / "1_activation_catalog.csv",
+        "CSV_GEE_EXPORT_STATUS":  meta / "2_gee_export_status.csv",
+        "CSV_COMPOSITE_REGISTRY": meta / "2_composite_registry.csv",
+        "CSV_DATASET_METADATA":   meta / "4_dataset_metadata.csv",
+        "CSV_COMPLETE_METADATA":  meta / "released_events_metadata.csv",
+        "CSV_MISSING_LAYERS":     meta / "4_missing_layers_report.csv",
+        "CSV_PATCH_METADATA":     meta / "released_patches_metadata.csv",
+        "CSV_PATCH_VALIDATION":   meta / "5_patch_validation_issues.csv",
+    }
+    for name, value in derived.items():
+        # Only rebase what config_local did not set itself.
+        if name not in _LOCAL_NAMES:
+            g[name] = value
+
+    # The three split CSVs live under SPLIT_DIR, which may itself have moved.
+    for name, fname in (("CSV_TRAIN_PATCHES", "train_patches.csv"),
+                        ("CSV_VAL_PATCHES",   "val_patches.csv"),
+                        ("CSV_TEST_PATCHES",  "test_patches.csv")):
+        if name not in _LOCAL_NAMES:
+            g[name] = g["SPLIT_DIR"] / fname
+
+
+_rebase_derived_paths()
 
 
 # Map old filenames -> new, for one-time on-disk migration (see migrate_csv_names).

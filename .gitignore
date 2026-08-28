@@ -16,3 +16,10 @@ metadata/flood_dataset.csv
 *.shx
 *.prj
 *.cpg
+
+# internal working trees (not part of the public pipeline)
+data_test/
+data_v1fix/
+data_paper/
+*.BAK
+config_local.py.*

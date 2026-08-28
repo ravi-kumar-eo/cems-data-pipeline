@@ -53,7 +53,9 @@ try:
     import rasterio
     from rasterio.transform import from_bounds, Affine
     from rasterio.features import rasterize as rio_rasterize
-    from rasterio.warp import reproject, Resampling
+    from rasterio.warp import reproject, Resampling, transform_bounds
+    from rasterio.coords import BoundingBox
+    from rasterio.crs import CRS
 except ImportError:
     print("ERROR: rasterio not found. Install with: pip install rasterio")
     sys.exit(1)
@@ -142,8 +144,12 @@ def _reproject_band(src, band_idx, dst, transform, crs, resampling):
 
 def _grid(ref_bounds, res) -> Tuple[int, int, Affine]:
     minx, miny, maxx, maxy = ref_bounds
-    width  = int((maxx - minx) / res)
-    height = int((maxy - miny) / res)
+    # At least one cell in each direction: an AOI narrower than one cell of the
+    # coarsest stack (2560 m) would otherwise floor to 0 and from_bounds would
+    # divide by zero. Such an event yields no full patch anyway and is dropped
+    # by the caller, but the grid must still be constructible to get there.
+    width  = max(1, int((maxx - minx) / res))
+    height = max(1, int((maxy - miny) / res))
     return width, height, from_bounds(minx, miny, maxx, maxy, width, height)
 
 
@@ -335,6 +341,9 @@ def write_patch(stacks, transforms, ref_crs, idx, r10, c10, out_dir) -> Optional
         "bounds_minx": minx, "bounds_miny": miny,
         "bounds_maxx": maxx, "bounds_maxy": maxy,
         "flood_pixels": int((pmask == 1).sum()),
+        # Share of the patch under water. Kept alongside the raw count so
+        # consumers can filter by flood density without knowing the grid size.
+        "flood_fraction": float((pmask == 1).sum()) / float(PX_10M * PX_10M),
     }
 
 
@@ -383,8 +392,8 @@ def find_gee_folder(folder_name: str) -> Optional[Path]:
 
 META_FIELDS  = ["patch_index", "emsr_code", "folder_name", "patch_number",
                 "crs", "bounds_minx", "bounds_miny", "bounds_maxx", "bounds_maxy",
-                "flood_pixels", "basin_id", "continent", "climate",
-                "resolution_post_sensor_m", "resolution_class"]
+                "flood_pixels", "flood_fraction", "basin_id", "continent", "climate",
+                "sensor_resolution_m", "resolution_class"]
 ISSUE_FIELDS = ["emsr_code", "folder_name", "patch", "file", "check", "detail"]
 
 
@@ -451,6 +460,37 @@ def main():
             continue
         with rasterio.open(merit) as src:
             ref_crs, ref_bounds = src.crs, src.bounds
+        # The patch grid is defined in METRES (PATCH_SIZE_M, RES_10M...), so the
+        # reference must be a projected CRS. MERIT is normally exported in the
+        # event's local UTM zone, but older exports are geographic (EPSG:4326):
+        # dividing a span in degrees by 10 m then floors to 0 and the grid
+        # collapses. Reproject those to the local UTM zone of the AOI centre.
+        if ref_crs is not None and ref_crs.is_geographic:
+            lon = (ref_bounds.left + ref_bounds.right) / 2.0
+            lat = (ref_bounds.bottom + ref_bounds.top) / 2.0
+            zone = int((lon + 180) // 6) + 1
+            utm = CRS.from_epsg((32600 if lat >= 0 else 32700) + zone)
+            b = transform_bounds(ref_crs, utm, *ref_bounds)
+            # Snap the reprojected extent DOWN to a whole number of 10 m cells.
+            # _grid() floors width to int(span / res), so a span that is not an
+            # exact multiple of the resolution leaves a remainder that
+            # from_bounds() spreads over the pixels, making them slightly larger
+            # than 10 m (observed up to 10.03 m) and every patch footprint
+            # correspondingly wider than PATCH_SIZE_M. Trimming the extent keeps
+            # the pixel size exact; at most one cell of ground is dropped.
+            w = (b[2] - b[0]) // RES_10M * RES_10M
+            h = (b[3] - b[1]) // RES_10M * RES_10M
+            ref_bounds = BoundingBox(b[0], b[1], b[0] + w, b[1] + h)
+            ref_crs = utm
+
+        # An AOI smaller than one patch in either direction yields no full patch.
+        # Skip it up front rather than building five stacks to tile nothing.
+        span_x = ref_bounds[2] - ref_bounds[0]
+        span_y = ref_bounds[3] - ref_bounds[1]
+        if span_x < PATCH_SIZE_M or span_y < PATCH_SIZE_M:
+            print(f"[{i}/{len(catalog)}] {folder_name}  -- AOI {span_x:.0f}x{span_y:.0f} m "
+                  f"< {PATCH_SIZE_M} m patch, no full patch fits, skipped")
+            continue
 
         t0 = time.time()
         s10,   t10   = build_stack_10m(gee, ref_bounds, ref_crs)
@@ -474,7 +514,7 @@ def main():
                 "continent": row.get("continent", ""),
                 "climate": row.get("climate", ""),
                 "resolution_class": row.get("resolution_class", ""),
-                "resolution_post_sensor_m": row.get("resolution_post_sensor", ""),
+                "sensor_resolution_m": row.get("sensor_resolution_m", ""),
             })
             for iss in validate_patch(out_dir, idx):
                 iss.update({"emsr_code": emsr, "folder_name": folder_name})

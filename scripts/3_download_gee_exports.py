@@ -62,11 +62,15 @@ except ImportError:
 # Drive read-only scope — we never write to the user's Drive
 SCOPES = ["https://www.googleapis.com/auth/drive.readonly"]
 
-BASE_DIR          = Path(__file__).resolve().parent.parent
-DATA_DIR          = BASE_DIR / "data"
-GEE_EXPORTS_DIR   = DATA_DIR / "GEE_exports"
-TOKEN_FILE        = DATA_DIR / ".gdrive_token.json"
-CREDENTIALS_DIR   = BASE_DIR / "Gdrive_credentials"
+# From config.py so a scripts/config_local.py override redirects this script
+# with the rest of the pipeline.
+import config
+
+BASE_DIR          = config.BASE_DIR
+DATA_DIR          = config.DATA_DIR
+GEE_EXPORTS_DIR   = config.GEE_EXPORTS_DIR
+TOKEN_FILE        = config.GDRIVE_TOKEN_FILE
+CREDENTIALS_DIR   = config.GDRIVE_CREDS_DIR
 
 
 # ─── AUTHENTICATION ───────────────────────────────────────────────────────────

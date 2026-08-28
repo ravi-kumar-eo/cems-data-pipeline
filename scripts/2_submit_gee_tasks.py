@@ -145,7 +145,9 @@ import gee_direct
 
 # Direct-mode output dir: same place Script 3 would download to, so Script 4
 # preprocessing picks the files up unchanged whichever mode produced them.
-GEE_EXPORTS_LOCAL = config.DATA_DIR / "GEE_exports"
+# Alias of GEE_EXPORTS_DIR (set in PATH SETUP below) — one directory, so the
+# resume check and the downloader can never disagree.
+GEE_EXPORTS_LOCAL = config.GEE_EXPORTS_DIR
 
 try:
     import ee
@@ -172,11 +174,16 @@ except ImportError:
 
 # ─── PATH SETUP ──────────────────────────────────────────────────────────────
 
-BASE_DIR     = Path(__file__).resolve().parent.parent
-DATA_DIR     = BASE_DIR / "data"
-META_DIR     = DATA_DIR / "metadata"
-ACTIVATIONS_DIR = DATA_DIR / "activations" / "activations_reorganized"
-GEE_EXPORTS_DIR = DATA_DIR / "GEE_exports"
+# All from config.py so a scripts/config_local.py override redirects this
+# script with the rest of the pipeline. GEE_EXPORTS_DIR must stay the same
+# directory the exports are written to (GEE_EXPORTS_LOCAL above), or the
+# "which layers are already on disk" check reads a different tree than the
+# downloader writes and every layer is re-exported on each run.
+BASE_DIR     = config.BASE_DIR
+DATA_DIR     = config.DATA_DIR
+META_DIR     = config.META_DIR
+ACTIVATIONS_DIR = config.ACTIVATIONS_DIR
+GEE_EXPORTS_DIR = config.GEE_EXPORTS_DIR
 GEE_TASKS_CSV            = config.CSV_GEE_EXPORT_STATUS
 
 # Layers this run exports, in registry order, after applying config toggles.
@@ -468,11 +475,23 @@ def find_layer_in_exports(folder_name: str, layer_name: str) -> Optional[Path]:
     Returns:
         Path to layer file if found, None otherwise
     """
-    search_dir = GEE_EXPORTS_DIR / folder_name
-    if search_dir.exists():
+    # Exports are written nested as {EMSR_code}/{folder_name}/ (see submit_layer),
+    # so look there first. The flat {folder_name}/ layout is kept as a fallback
+    # for older Drive-era folders that were never re-nested.
+    candidates = [GEE_EXPORTS_DIR / folder_name.split("_")[0] / folder_name,
+                  GEE_EXPORTS_DIR / folder_name]
+    stem = Path(layer_name).stem
+    for search_dir in candidates:
         layer_path = search_dir / layer_name
         if layer_path.exists():
             return layer_path
+        # Temporal layers carry their window in the filename
+        # (Precipitation.tif -> Precipitation_20230122_20230220.tif), so an
+        # exact-name lookup misses them; match on the stem prefix instead.
+        if search_dir.is_dir():
+            hits = sorted(search_dir.glob(f"{stem}_*.tif"))
+            if hits:
+                return hits[0]
     return None
 
 
@@ -672,12 +691,15 @@ def build_s1(region, event_date: date):
 
     s1_result = None
     s1_coverage = 0.0
+    used_window = None
+    n_images_used = 0
 
     for window_days in S1_WINDOWS:
         print(f"        S1   → Window {window_days} days: ", end="")
 
         col = _get_s1_collection(window_days)
         composite = col.median()
+        used_window = window_days
 
         # Measure ACTUAL coverage using .getInfo()
         try:
@@ -691,6 +713,10 @@ def build_s1(region, event_date: date):
                 s1_result = s1_result.unmask(composite)
 
             s1_coverage = coverage
+            try:
+                n_images_used = col.size().getInfo()
+            except Exception:
+                n_images_used = 0
 
             # STOP if coverage sufficient
             if coverage >= (S1_TARGET_COVERAGE * 100):
@@ -709,14 +735,23 @@ def build_s1(region, event_date: date):
     # If no composite was built (no S1 images available), mark as NA
     if s1_result is None:
         print(f"        S1   ! No S1 images available - SKIPPING task submission")
-        return None
+        return None, {}
 
     # Check if final coverage is sufficient
     if s1_coverage < (S1_TARGET_COVERAGE * 100):
         print(f"        S1   ! Coverage {s1_coverage:.2f}% < {S1_TARGET_COVERAGE*100}% after all windows - SKIPPING task submission")
-        return None
+        return None, {}
 
-    return s1_result.unmask(-9999)
+    # Provenance for the composite registry: which acquisition window the
+    # median was actually built from, and the coverage it achieved.
+    prov = {
+        "window_days": used_window,
+        "start_date": (event_date - timedelta(days=used_window)).isoformat(),
+        "end_date": event_date.isoformat(),
+        "n_images": n_images_used,
+        "coverage_pct": round(s1_coverage, 2),
+    }
+    return s1_result.unmask(-9999), prov
 
 
 def build_s2_indices(region, event_date: date):
@@ -767,6 +802,20 @@ def build_s2_indices(region, event_date: date):
         ndbi = s2_median.normalizedDifference(["B11", "B8"]).rename("NDBI")
         return ee.Image.cat([ndvi, ndbi])
 
+
+    def _s2_prov(seasonal_used, seasonal_year, final_cov):
+        """Provenance for the composite registry."""
+        return {
+            "window_days": S2_WINDOW_DAYS,
+            "start_date": start_date.isoformat(),
+            "end_date": end_date.isoformat(),
+            "cloud_pct": used_cloud,
+            "n_images": n_images_cur,
+            "coverage_pct": round(final_cov, 2),
+            "seasonal_fallback": bool(seasonal_used),
+            "seasonal_year": seasonal_year or "",
+        }
+
     # ── Iterative Coverage Check: Current Year ────────────────────────────
     start_date = event_date - timedelta(days=S2_WINDOW_DAYS)
     end_date = event_date
@@ -776,6 +825,8 @@ def build_s2_indices(region, event_date: date):
 
     current_year_result = None
     current_year_coverage = 0.0
+    used_cloud = None
+    n_images_cur = 0
 
     for cloud_threshold in all_cloud_thresholds:
         print(f"        S2   → Cloud threshold {cloud_threshold}%: ", end="")
@@ -807,6 +858,8 @@ def build_s2_indices(region, event_date: date):
                 current_year_result = current_year_result.unmask(composite)
 
             current_year_coverage = coverage
+            used_cloud = cloud_threshold
+            n_images_cur = num_images
 
             # STOP if coverage sufficient
             if coverage >= (S2_COVERAGE_THRESHOLD * 100):
@@ -825,17 +878,17 @@ def build_s2_indices(region, event_date: date):
     # If no composite was built (no S2 images available), mark as NA
     if current_year_result is None:
         print(f"        S2   ! No S2 images available - SKIPPING task submission")
-        return None
+        return None, {}
 
     # ── Check if Seasonal Fallback Needed ─────────────────────────────────
     if not S2_USE_SEASONAL_FALLBACK:
         print(f"        S2 Seasonal fallback: DISABLED")
-        return current_year_result.unmask(-9999)
+        return current_year_result.unmask(-9999), _s2_prov(False, None, current_year_coverage)
 
     # Only add seasonal if coverage insufficient
     if current_year_coverage >= (S2_COVERAGE_THRESHOLD * 100):
         print(f"        S2 Seasonal fallback: NOT NEEDED (coverage {current_year_coverage:.2f}% >= {S2_COVERAGE_THRESHOLD*100}%)")
-        return current_year_result.unmask(-9999)
+        return current_year_result.unmask(-9999), _s2_prov(False, None, current_year_coverage)
 
     # Coverage insufficient - add seasonal fallback
     print(f"        S2 Seasonal fallback: NEEDED (coverage {current_year_coverage:.2f}% < {S2_COVERAGE_THRESHOLD*100}%)")
@@ -918,23 +971,73 @@ def build_s2_indices(region, event_date: date):
 
                 if final_coverage < (S2_COVERAGE_THRESHOLD * 100):
                     print(f"        S2   ! Coverage {final_coverage:.2f}% < {S2_COVERAGE_THRESHOLD*100}% even after seasonal - SKIPPING task submission")
-                    return None
+                    return None, {}
 
-                return final_result.unmask(-9999)
+                return final_result.unmask(-9999), _s2_prov(True, seasonal_year, final_coverage)
             except Exception as e:
                 print(f"        S2   ! Failed to calculate final coverage: {e} - SKIPPING task submission")
-                return None
+                return None, {}
         else:
             print(f"        S2   ! No seasonal images available, coverage {current_year_coverage:.2f}% < {S2_COVERAGE_THRESHOLD*100}% - SKIPPING task submission")
-            return None
+            return None, {}
 
     except ValueError:
         # Handle leap year edge case (Feb 29)
         print(f"        S2 Seasonal fallback: Leap year edge case (Feb 29) - skipping seasonal")
         if current_year_coverage < (S2_COVERAGE_THRESHOLD * 100):
             print(f"        S2   ! Coverage {current_year_coverage:.2f}% < {S2_COVERAGE_THRESHOLD*100}% - SKIPPING task submission")
-            return None
-        return current_year_result.unmask(-9999)
+            return None, {}
+        return current_year_result.unmask(-9999), _s2_prov(False, None, current_year_coverage)
+
+
+
+# ─── COMPOSITE PROVENANCE REGISTRY ───────────────────────────────────────────
+
+COMPOSITE_REGISTRY_FIELDS = [
+    "folder_name", "layer", "filename", "event_date",
+    "start_date", "end_date", "window_days",
+    "n_images", "coverage_pct", "cloud_pct",
+    "seasonal_fallback", "seasonal_year",
+]
+
+
+def record_composite(act_name: str, layer: str, filename: str,
+                     event_date: date, prov: Dict) -> None:
+    """
+    Append one row of composite provenance to config.CSV_COMPOSITE_REGISTRY.
+
+    S1 and S2 are median composites over a window of acquisitions, so the
+    exported GeoTIFF has no single acquisition date of its own. This records
+    the window that was actually used — it widens (S1) or relaxes its cloud
+    threshold (S2) until coverage is met, so it is not predictable from the
+    event date alone. Nothing downstream reads this file; it exists so a
+    released composite can be traced back to its source imagery.
+
+    Rewrites in place on re-export so one (folder, layer) keeps a single row.
+    """
+    path = config.CSV_COMPOSITE_REGISTRY
+    row = {
+        "folder_name": act_name, "layer": layer, "filename": filename,
+        "event_date": event_date.isoformat(),
+        "start_date": prov.get("start_date", ""), "end_date": prov.get("end_date", ""),
+        "window_days": prov.get("window_days", ""),
+        "n_images": prov.get("n_images", ""),
+        "coverage_pct": prov.get("coverage_pct", ""),
+        "cloud_pct": prov.get("cloud_pct", ""),
+        "seasonal_fallback": prov.get("seasonal_fallback", ""),
+        "seasonal_year": prov.get("seasonal_year", ""),
+    }
+    rows = []
+    if path.exists():
+        with open(path, newline="", encoding="utf-8") as f:
+            rows = [r for r in csv.DictReader(f)
+                    if not (r.get("folder_name") == act_name and r.get("layer") == layer)]
+    rows.append(row)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "w", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=COMPOSITE_REGISTRY_FIELDS, extrasaction="ignore")
+        w.writeheader()
+        w.writerows(rows)
 
 
 # ─── MAIN ────────────────────────────────────────────────────────────────────
@@ -999,16 +1102,23 @@ def submit_for_activation(act_folder: Path, download_tracker: DownloadTracker) -
         if not download_tracker.needs_submission(act_name, key):
             continue
         print(f"      → {key}")
+        # Write the canonical filename from the registry (S1 -> S1_VV_VH.tif),
+        # not the layer key. Exporting under the key forced Script 4 to rename
+        # every file afterwards, so the same layer had two names on disk
+        # depending on which step had run.
+        stem = spec.filename[:-4]
 
         if spec.kind == "composite":
             build = COMPOSITE_BUILDERS[spec.builder_name]
-            img = build(region, event_date)
+            img, prov = build(region, event_date)
             if img is None:
                 print(f"        ✗ Marked as NA (no images available)")
                 download_tracker.mark_layer_na(emsr_code, act_name, key)
                 continue
-            ok = _submit(img, desc(key), prefix(key), region, crs_tf, act_name, key,
+            ok = _submit(img, desc(stem), prefix(stem), region, crs_tf, act_name, key,
                          bounds4=(minx, miny, maxx, maxy), pixel=PIXEL_DEG)
+            if ok and prov:
+                record_composite(act_name, key, spec.filename, event_date, prov)
 
         elif spec.kind == "temporal":
             deg = TEMPORAL_DEG.get(key, spec.resolution_m / 111000.0)
@@ -1030,13 +1140,13 @@ def submit_for_activation(act_folder: Path, download_tracker: DownloadTracker) -
             # same AOI footprint. ESA_PW (10 m) lands on the fine reference grid;
             # MERIT (90 m) and SoilGrids (250 m) keep their coarse native pixels.
             if abs(spec.resolution_m - 10.0) < 1e-6:
-                ok = _submit(img, desc(key), prefix(key), region, crs_tf, act_name, key,
+                ok = _submit(img, desc(stem), prefix(stem), region, crs_tf, act_name, key,
                              bounds4=(minx, miny, maxx, maxy), pixel=PIXEL_DEG)
             else:
                 deg = spec.resolution_m / 111000.0
                 s_minx, s_miny, s_maxx, s_maxy, s_tf = _snap_bounds(*bounds, deg)
                 s_region = _gee_region(s_minx, s_miny, s_maxx, s_maxy)
-                ok = _submit(img, desc(key), prefix(key), s_region, s_tf, act_name, key,
+                ok = _submit(img, desc(stem), prefix(stem), s_region, s_tf, act_name, key,
                              bounds4=(s_minx, s_miny, s_maxx, s_maxy), pixel=deg)
 
         if ok and config.EXPORT_MODE == "direct":

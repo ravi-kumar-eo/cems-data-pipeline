@@ -259,6 +259,7 @@ SENSOR_RESOLUTION = {
     'Pléiades Neo': 0.3,
     'Pléiades-1A': 0.5, 'Pléiades-1B': 0.5, 'Pléiades-1A/B': 0.5, 'Pléiades': 0.5,
     'WorldView-1': 0.5, 'WorldView-2': 0.5, 'WorldView-3': 0.5, 'WorldView-4': 0.5,
+    'WorldView': 0.5,   # unqualified in some PDFs; every WorldView is 0.5 m here
     'GeoEye-1': 0.5, 'SkySat': 0.5, 'Legion': 0.5, 'Deimos-2': 0.75,
     'SPOT-6': 1.5, 'SPOT-7': 1.5, 'SPOT-6/7': 1.5, 'SPOT': 1.5,
     'ICEYE': 2.5,
@@ -433,56 +434,58 @@ def download_hydrobasins_level12():
 
 def get_basin_id(aoi_shp_path: Path, basins_gdf: gpd.GeoDataFrame) -> Optional[str]:
     """
-    Get the HydroBASINS Pfafstetter Level-5 basin code for an activation, based on
-    the AOI centroid. The Level-5 code is the first 5 digits of the PFAF_ID of the
-    Level-12 basin the centroid falls in.
+    HydroBASINS Pfafstetter Level-5 code(s) for an activation: EVERY Level-5
+    basin whose Level-12 cell intersects the AOI's BOUNDING BOX, '-'-joined.
 
-    Strategy:
-    1. Try 'within' query first (centroid inside basin)
-    2. If no match, find nearest basin (handles coastal/ocean areas)
+    The bounding box, not the AOI polygon and not its centroid. That is the rule
+    the released catalog was built with, verified against the stored basin_id on
+    a 25-event sample: bbox matched 24/25, polygon 19/25, centroid 14/25. The
+    bbox reaches basins the AOI outline itself does not touch, and the released
+    data includes them — 34% of released events carry more than one basin.
+
+    An earlier version of this function used the centroid and returned a single
+    code. That silently REPLACED the richer values whenever an existing event was
+    re-processed, and basin_id drives the split's basin-exclusivity constraint,
+    so a weaker basin set means a weaker leakage guarantee. Do not "simplify"
+    this back to a centroid lookup.
 
     Args:
         aoi_shp_path: Path to AOI shapefile
         basins_gdf: GeoDataFrame of HydroBASINS level 12 (must include PFAF_ID)
 
     Returns:
-        Level-5 Pfafstetter code as string (e.g. "23218"), or None if not found
+        '-'-joined Level-5 codes, ascending (e.g. "18170-18180-18191"), or None.
     """
+    from shapely.geometry import box
+
     def _l5(pfaf_id) -> str:
         return str(int(pfaf_id))[:5]
 
     try:
-        # Read AOI shapefile
         aoi_gdf = gpd.read_file(aoi_shp_path)
-
-        # Get centroid in WGS84
-        if aoi_gdf.crs.to_epsg() != 4326:
+        if aoi_gdf.crs is not None and aoi_gdf.crs.to_epsg() != 4326:
             aoi_gdf = aoi_gdf.to_crs(epsg=4326)
-
-        centroid = aoi_gdf.unary_union.centroid
-
-        # Ensure basins are in WGS84
-        if basins_gdf.crs.to_epsg() != 4326:
+        if basins_gdf.crs is not None and basins_gdf.crs.to_epsg() != 4326:
             basins_gdf = basins_gdf.to_crs(epsg=4326)
 
-        # Try 1: Find basin containing centroid
-        point_gdf = gpd.GeoDataFrame({'geometry': [centroid]}, crs='EPSG:4326')
-        joined = gpd.sjoin(point_gdf, basins_gdf, how='left', predicate='within')
+        bbox = box(*aoi_gdf.total_bounds)
+        hit = basins_gdf[basins_gdf.intersects(bbox)]
 
-        if len(joined) > 0 and 'PFAF_ID' in joined.columns and not pd.isna(joined.iloc[0]['PFAF_ID']):
-            return _l5(joined.iloc[0]['PFAF_ID'])
+        if len(hit):
+            codes = sorted({_l5(v) for v in hit["PFAF_ID"]})
+            return "-".join(codes)
 
-        # Try 2: Find nearest basin (for coastal/ocean areas)
-        basins_gdf['distance'] = basins_gdf.geometry.distance(centroid)
-        nearest_idx = basins_gdf['distance'].idxmin()
-
-        # Only use nearest if it's reasonably close (within ~50km = ~0.5 degrees)
-        if basins_gdf.loc[nearest_idx, 'distance'] < 0.5:
-            return _l5(basins_gdf.loc[nearest_idx, 'PFAF_ID'])
+        # No intersection at all — an AOI wholly offshore. Fall back to the
+        # nearest basin so the event still gets a code rather than None.
+        centroid = aoi_gdf.union_all().centroid
+        dist = basins_gdf.geometry.distance(centroid)
+        nearest = dist.idxmin()
+        if dist.loc[nearest] < 0.5:          # ~50 km
+            return _l5(basins_gdf.loc[nearest, "PFAF_ID"])
 
         return None
 
-    except Exception as e:
+    except Exception:
         return None
 
 
@@ -904,9 +907,12 @@ def main():
         catalog_records.append({
             'folder_name': folder_name,
             'basin_id': basin_id,
-            'pre_event_sensor': sensors.get('pre_event_sensor', ''),
-            'post_event_sensors': post_sensors,
-            'resolution_post_sensor': res_m if res_m is not None else '',
+            # One sensor column in the released schema: the POST-event sensor,
+            # i.e. the imagery the CEMS flood delineation was drawn from. That
+            # is what resolution_class is derived from, so it is the one that
+            # describes label quality. The pre-event sensor is not carried.
+            'event_sensor': post_sensors,
+            'sensor_resolution_m': res_m if res_m is not None else '',
             'resolution_class': classify_resolution(res_m),
             'continent': continent if continent is not None else '',
             'climate': climate if climate is not None else '',
@@ -918,9 +924,8 @@ def main():
             print(f"  Processed {idx + 1}/{total} activations...")
 
     fieldnames = [
-        'folder_name', 'basin_id',
-        'pre_event_sensor', 'post_event_sensors',
-        'resolution_post_sensor', 'resolution_class',
+        'folder_name', 'basin_id', 'event_sensor',
+        'sensor_resolution_m', 'resolution_class',
         'continent', 'climate', 'aoi_area_km2', 'flooded_area_km2',
     ]
 

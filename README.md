@@ -1,6 +1,6 @@
 # CEMS Multi-Resolution Flood Dataset
 
-The CEMS Multi-Resolution Flood Dataset is a global, machine-learning-ready dataset for flood mapping. It pairs **527,600** co-registered image patches with observed flood extents from **1,535** Copernicus Emergency Management Service (CEMS) flood events, drawn from **188** rapid-mapping activations between April 2017 and November 2025 and spanning **281** river basins, six continents, and all five Köppen climate zones.
+The CEMS Multi-Resolution Flood Dataset is a global, machine-learning-ready dataset for flood mapping. It pairs **566,669** co-registered image patches with observed flood extents from **1,565** Copernicus Emergency Management Service (CEMS) flood events, drawn from **190** rapid-mapping activations between April 2017 and December 2025 and spanning **283** river basins, six continents, and all five Köppen climate zones.
 
 | Layer | Source | Native resolution | Bands |
 |---|---|---|---|
@@ -35,7 +35,7 @@ The permanent-water band lets a model tell pre-existing water from new flooding,
 
 ### Patch index and splits
 
-Every patch is listed in `released_patches_metadata.csv` in the metadata folder, one row per tile. The three split files in the split_global folder, `train_patches.csv`, `val_patches.csv`, and `test_patches.csv`, are the same table filtered by the `split` column, so each can be loaded directly as a training, validation, or test set. The split is exclusive by HydroBASINS Pfafstetter Level-5 basin and by whole event, so no basin and no event crosses the train, validation, and test sets. The released split contains 417,327 patches (79.1%) from 916 events in training, 57,263 (10.9%) from 277 events in validation, and 53,010 (10.0%) from 342 events in test.
+Every patch is listed in `released_patches_metadata.csv` in the metadata folder, one row per tile. The three split files in the split_global folder, `train_patches.csv`, `val_patches.csv`, and `test_patches.csv`, are the same table filtered by the `split` column, so each can be loaded directly as a training, validation, or test set. The split is exclusive by HydroBASINS Pfafstetter Level-5 basin and by whole event, so no basin and no event crosses the train, validation, and test sets. The released split contains 427,824 patches (75.5%) from 916 events in training, 68,763 (12.1%) from 307 events in validation, and 70,082 (12.4%) from 342 events in test.
 
 A tile is addressed by `(emsr_code, folder_name, patch_number)`, which locate its files on disk, so the CSV references patches relationally rather than by absolute path. The key columns are below.
 
@@ -48,10 +48,11 @@ A tile is addressed by `(emsr_code, folder_name, patch_number)`, which locate it
 | `crs` | coordinate reference system of the tile (per-event UTM zone) |
 | `bounds_minx/miny/maxx/maxy` | tile footprint bounds in `crs` units (m) |
 | `flood_pixels` | number of flooded pixels in the tile, from the flood mask |
+| `flood_fraction` | fraction of the tile that is flooded, 0-1 (`flood_pixels` / 65,536) |
 | `basin_id` | HydroBASINS Pfafstetter Level-5 code(s) of the event |
 | `continent` | continent of the event |
 | `climate` | Köppen-Geiger main class of the event |
-| `resolution_post_sensor_m` | resolution of the sensor used for the delineation (m) |
+| `sensor_resolution_m` | resolution of the sensor used for the delineation (m) |
 | `resolution_class` | medium, high, or very-high |
 | `split` | train, val, or test |
 
@@ -152,6 +153,7 @@ data/
     1_activation_catalog.csv        activation catalog (Script 1)
     1_activation_status.csv         per-product download + reorganization status (Script 1)
     2_gee_export_status.csv         per-layer GEE export status (Script 2)
+    2_composite_registry.csv        S1/S2 composite provenance: acquisition window, cloud threshold, image count (Script 2)
     4_dataset_metadata.csv          events new in the latest run (Script 4)
     released_events_metadata.csv    full accumulated dataset catalog, one row per event (Script 4)
     4_missing_layers_report.csv     missing enabled layers per activation (Script 4)
@@ -178,7 +180,7 @@ The columns are below.
 | `folder_name` | event folder name |
 | `basin_id` | HydroBASINS Pfafstetter Level-5 code(s) |
 | `event_sensor` | sensor used for the flood delineation |
-| `resolution_post_sensor` | resolution of that sensor (m) |
+| `sensor_resolution_m` | resolution of that sensor (m) |
 | `resolution_class` | medium, high, or very-high |
 | `continent` | continent of the area of interest |
 | `climate` | Köppen-Geiger main class |
