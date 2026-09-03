@@ -1,6 +1,12 @@
-# CEMS Multi-Resolution Flood Dataset
+# FloodPULSEO
 
-The CEMS Multi-Resolution Flood Dataset is a global, machine-learning-ready dataset for flood mapping. It pairs **566,669** co-registered image patches with observed flood extents from **1,565** Copernicus Emergency Management Service (CEMS) flood events, drawn from **190** rapid-mapping activations between April 2017 and December 2025 and spanning **283** river basins, six continents, and all five Köppen climate zones.
+**A global, multi-resolution dataset for flood prediction from pre-event conditions.**
+
+FloodPULSEO is a machine-learning-ready dataset that pairs **566,669** co-registered image patches with observed flood extents from **1,565** Copernicus Emergency Management Service (CEMS) flood events, drawn from **190** rapid-mapping activations between April 2017 and December 2025 and spanning **283** river basins, six continents, and all five Köppen climate zones.
+
+![How FloodPULSEO is built: CEMS flood labels and Earth Engine layers are collected per event, then resampled and stacked into 2.56 km patches](images/pipeline.png)
+
+### Input layers
 
 | Layer | Source | Native resolution | Bands |
 |---|---|---|---|
@@ -16,6 +22,16 @@ The CEMS Multi-Resolution Flood Dataset is a global, machine-learning-ready data
 Every input precedes the flood, so the dataset poses flood **prediction** from antecedent conditions rather than post-event mapping. It is released as patch tiles with the train, validation, and test split already assigned, ready to load for model training. The full pipeline that produces the patches is included, so the release can be rebuilt from scratch or extended to new flood activations with a Google Earth Engine account.
 
 **Dataset:** [Zenodo DOI to be added]
+
+---
+
+## Coverage
+
+![Global distribution of the 1,565 flood events, coloured by train, validation and test split, with insets over Europe, Central America, Madagascar and eastern Australia, and the breakdown by continent and Köppen climate zone](images/data_distributions.png)
+
+Events span 2017-2025 across six continents and all five Köppen climate zones, covering **83 billion m²** of observed inundation. Coverage is not uniform: Europe contributes **1,092** of the 1,565 events (69.8%), a consequence of CEMS activation patterns rather than of flood occurrence. Models trained on FloodPULSEO should be evaluated with that imbalance in mind.
+
+---
 
 ## Dataset description
 
@@ -71,8 +87,8 @@ Each activation supplies two CEMS vector components: the AOI boundary (`aoi/aoi.
 ## Setup
 
 ```bash
-conda create -n cems_pipeline python=3.11
-conda activate cems_pipeline
+conda create -n floodpulseo python=3.11
+conda activate floodpulseo
 pip install -r requirements.txt
 ```
 
@@ -85,20 +101,22 @@ earthengine authenticate
 
 ## Pipeline
 
-```
-config.py                        Edit first: enable/disable layers, set daily-series length, set patch size
-add_gee_layers.py                Layer registry. Copy a template here to add a custom GEE layer
-1_download_activations.py        Download EMSR flood activations from Copernicus + reorganize into standardized folders
-2_submit_gee_tasks.py            Download the enabled layers per activation straight into data/GEE_exports/
-3_gee_output_preprocessing.py    Rasterize flood masks + permanent water, add continent, climate, and area columns, and build the catalog (downloads a continents layer + Koppen raster on first run)
-4_make_patches.py                Cut events into model-ready 2.56 km patch tiles
-5_make_splits.py                 Assign basin- and event-exclusive train/val/test split (balances by patch count, so runs after patching)
-```
+Two files configure a run, and five numbered scripts execute it in order.
 
-Step 2 fetches each layer straight into `data/GEE_exports/` in tiled requests, so Step 3 can run as soon as Step 2 finishes. The download runs locally, so the machine stays busy for the length of the batch.
+| File | What it does |
+|---|---|
+| `config.py` | **Edit first.** Enable or disable layers, set the daily-series length N, set the patch size |
+| `add_gee_layers.py` | Layer registry. Copy a template here to add a custom GEE layer |
+| **1** `_download_activations.py` | Download EMSR flood activations from Copernicus, reorganize into standardized folders |
+| **2** `_submit_gee_tasks.py` | Download the enabled layers per activation straight into `data/GEE_exports/` |
+| **3** `_gee_output_preprocessing.py` | Rasterize flood masks and permanent water, add continent, climate and area columns, build the catalog |
+| **4** `_make_patches.py` | Cut events into model-ready 2.56 km patch tiles |
+| **5** `_make_splits.py` | Assign the basin- and event-exclusive train/val/test split |
+
+Step 2 fetches each layer straight into `data/GEE_exports/` in tiled requests, so Step 3 can run as soon as Step 2 finishes. The download runs locally, so the machine stays busy for the length of the batch. Step 3 downloads a continents layer and a Köppen raster on its first run. Step 5 balances by patch count, so it runs after patching.
 
 ```bash
-conda activate cems_pipeline
+conda activate floodpulseo
 python scripts/1_download_activations.py
 python scripts/2_submit_gee_tasks.py
 python scripts/3_gee_output_preprocessing.py
@@ -171,3 +189,18 @@ The columns are below.
 | `aoi_area_km2` | area of interest size (km²) |
 | `flooded_area_km2` | area under water (km²) |
 | `n_patches` | number of patches cut from the event |
+
+---
+
+## Data sources and credits
+
+Flood labels and event metadata come from the [Copernicus Emergency Management Service Rapid Mapping](https://emergency.copernicus.eu/) service. The satellite and geospatial layers are accessed through [Google Earth Engine](https://earthengine.google.com/): Sentinel-1 and Sentinel-2 (ESA/Copernicus), MERIT Hydro, SoilGrids (OpenLandMap), ESA WorldCover, GPM IMERG and SMAP (NASA). Basin boundaries are HydroBASINS Pfafstetter Level-5, and climate zones follow the Köppen-Geiger classification.
+
+## Citation
+
+A data paper describing FloodPULSEO is in preparation. Until it appears, please cite the Zenodo record.
+
+```
+[Zenodo citation to be added]
+```
+
