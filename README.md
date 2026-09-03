@@ -60,9 +60,9 @@ A tile is addressed by `(emsr_code, folder_name, patch_number)`, which locate it
 
 ## Building or extending the dataset
 
-The rest of this README documents the open pipeline that builds the dataset from scratch. Use it to reproduce the release or to extend it to newer activations. The pipeline produces the eight per-event layers of the overview table (the seven geospatial layers plus the flood mask) as full-scene GeoTIFFs, Step 5 tiles them into the patches described above, and Step 6 assigns the train, validation, and test split.
+The rest of this README documents the open pipeline that builds the dataset from scratch. Use it to reproduce the release or to extend it to newer activations. The pipeline produces the eight per-event layers of the overview table (the seven geospatial layers plus the flood mask) as full-scene GeoTIFFs, Step 4 tiles them into the patches described above, and Step 5 assigns the train, validation, and test split.
 
-The seven geospatial layers are configurable in `scripts/config.py`. `LAYER_TOGGLES` enables or disables each layer, `N_DAYS_OVERRIDE` sets the daily-series length N for the temporal layers (default 30), and `EXPORT_MODE` selects how Step 2 delivers the layers (see below). New GEE layers can be added by copying a template in `scripts/add_gee_layers.py`. The full-scene files keep their own names: `S1_VV_VH.tif`, `S2_NDVI_NDBI.tif`, `MERIT.tif`, `Soil.tif`, `ESA_WorldCover_PermanentWater.tif`, and the temporal layers carry their antecedent window in the filename, for example `Precipitation_20240714_20240812.tif`. `flood_mask.tif` is produced in Step 4 by rasterizing the CEMS delineation.
+The seven geospatial layers are configurable in `scripts/config.py`. `LAYER_TOGGLES` enables or disables each layer, and `N_DAYS_OVERRIDE` sets the daily-series length N for the temporal layers (default 30). New GEE layers can be added by copying a template in `scripts/add_gee_layers.py`. The full-scene files keep their own names: `S1_VV_VH.tif`, `S2_NDVI_NDBI.tif`, `MERIT.tif`, `Soil.tif`, `ESA_WorldCover_PermanentWater.tif`, and the temporal layers carry their antecedent window in the filename, for example `Precipitation_20240714_20240812.tif`. `flood_mask.tif` is produced in Step 3 by rasterizing the CEMS delineation.
 
 Each activation supplies two CEMS vector components: the AOI boundary (`aoi/aoi.shp`) and the flood extent (`flood_extent/event.shp`). Permanent water comes from ESA WorldCover, which covers every event.
 
@@ -81,46 +81,29 @@ pip install -r requirements.txt
 earthengine authenticate
 ```
 
-**Google Drive authentication (once, `drive` mode only):**  
-Skip this if `EXPORT_MODE` is `"direct"`, the default. Two one-time steps, both per Google Cloud project:
-
-1. **Enable the Drive API:** [console.cloud.google.com](https://console.cloud.google.com) → APIs & Services → Enable APIs → search **Google Drive API** → Enable  
-   *(Even with credentials.json in place, the API must be explicitly enabled in the project. This is separate from credentials.)*
-2. **Download OAuth credentials:** APIs & Services → Credentials → Create Credentials → OAuth client ID → Desktop app → Download JSON → place in `Gdrive_credentials/` (any filename is fine)
-
-First run of Script 3 will open a browser for OAuth approval. The token is saved to `data/.gdrive_token.json`, so subsequent runs do not prompt.
-
 ---
 
 ## Pipeline
 
 ```
-config.py                        Edit first: enable/disable layers, set daily-series length, choose the export mode
+config.py                        Edit first: enable/disable layers, set daily-series length, set patch size
 add_gee_layers.py                Layer registry. Copy a template here to add a custom GEE layer
 1_download_activations.py        Download EMSR flood activations from Copernicus + reorganize into standardized folders
-2_submit_gee_tasks.py            Fetch the enabled layers per activation, direct to disk or as Drive export tasks
-3_download_gee_exports.py        drive mode only: download all EMSR* folders from Google Drive to data/GEE_exports/
-4_gee_output_preprocessing.py    Rasterize flood masks + permanent water, add continent, climate, and area columns, and build the catalog (downloads a continents layer + Koppen raster on first run)
-5_make_patches.py                Cut events into model-ready 2.56 km patch tiles
-6_make_splits.py                 Assign basin- and event-exclusive train/val/test split (balances by patch count, so runs after patching)
+2_submit_gee_tasks.py            Download the enabled layers per activation straight into data/GEE_exports/
+3_gee_output_preprocessing.py    Rasterize flood masks + permanent water, add continent, climate, and area columns, and build the catalog (downloads a continents layer + Koppen raster on first run)
+4_make_patches.py                Cut events into model-ready 2.56 km patch tiles
+5_make_splits.py                 Assign basin- and event-exclusive train/val/test split (balances by patch count, so runs after patching)
 ```
 
-Step 2 delivers the layers in one of two modes, set by `EXPORT_MODE` in `config.py`.
-
-- **`"direct"`** (default) fetches each layer straight into `data/GEE_exports/` in tiled requests. No Google Drive account and no Step 3 are needed, and Step 4 can run as soon as Step 2 finishes. The download runs locally, so the machine stays busy for the length of the batch.
-- **`"drive"`** submits one Earth Engine export task per layer to Google Drive, which Step 3 then downloads. Earth Engine renders the exports on its own servers while nothing runs locally, which suits very large batches, at the cost of the Drive setup and the wait for the task queue.
-
-Both modes write the same files onto the same grid, so the choice does not change the output.
+Step 2 fetches each layer straight into `data/GEE_exports/` in tiled requests, so Step 3 can run as soon as Step 2 finishes. The download runs locally, so the machine stays busy for the length of the batch.
 
 ```bash
 conda activate cems_pipeline
 python scripts/1_download_activations.py
 python scripts/2_submit_gee_tasks.py
-# drive mode only: wait for the tasks at code.earthengine.google.com/tasks, then
-# python scripts/3_download_gee_exports.py
-python scripts/4_gee_output_preprocessing.py
-python scripts/5_make_patches.py
-python scripts/6_make_splits.py
+python scripts/3_gee_output_preprocessing.py
+python scripts/4_make_patches.py
+python scripts/5_make_splits.py
 ```
 
 ---
@@ -154,24 +137,24 @@ data/
     1_activation_status.csv         per-product download + reorganization status (Script 1)
     2_gee_export_status.csv         per-layer GEE export status (Script 2)
     2_composite_registry.csv        S1/S2 composite provenance: acquisition window, cloud threshold, image count (Script 2)
-    4_dataset_metadata.csv          events new in the latest run (Script 4)
-    released_events_metadata.csv    full accumulated dataset catalog, one row per event (Script 4)
-    4_missing_layers_report.csv     missing enabled layers per activation (Script 4)
-    released_patches_metadata.csv   one row per patch tile (Script 5; split added in Script 6)
-    5_patch_validation_issues.csv   per-patch QC findings (Script 5)
+    3_dataset_metadata.csv          events new in the latest run (Script 3)
+    released_events_metadata.csv    full accumulated dataset catalog, one row per event (Script 3)
+    3_missing_layers_report.csv     missing enabled layers per activation (Script 3)
+    released_patches_metadata.csv   one row per patch tile (Script 4; split added in Script 5)
+    4_patch_validation_issues.csv   per-patch QC findings (Script 4)
     split_global/
-      train_patches.csv             patch index filtered to the train split (Script 6)
-      val_patches.csv               patch index filtered to the validation split (Script 6)
-      test_patches.csv              patch index filtered to the test split (Script 6)
+      train_patches.csv             patch index filtered to the train split (Script 5)
+      val_patches.csv               patch index filtered to the validation split (Script 5)
+      test_patches.csv              patch index filtered to the test split (Script 5)
   plots/
-    splits/                         split balance plots (Script 6)
+    splits/                         split balance plots (Script 5)
 ```
 
 ---
 
 ## Dataset catalog
 
-The released catalog is `released_events_metadata.csv`, one row per event across the whole dataset. Its `folder_name` keys into the patches, GEE_exports, and activations_reorganized folders. An activation sometimes maps the same area on the same date more than once, as a delineation, graded, and flood-extent product. Only one of those events is kept, taking the delineation product first, then graded, then flood extent, and within one product type the version with the larger flooded fraction. A pipeline run does not rewrite it; Step 4 writes only the events new in that run to `4_dataset_metadata.csv` and appends them to the released catalog, so prior events and their assigned splits are preserved. Step 4 fills the continent, climate, aoi_area_km2, and flooded_area_km2 columns, and Step 6 fills the split column.
+The released catalog is `released_events_metadata.csv`, one row per event across the whole dataset. Its `folder_name` keys into the patches, GEE_exports, and activations_reorganized folders. An activation sometimes maps the same area on the same date more than once, as a delineation, graded, and flood-extent product. Only one of those events is kept, taking the delineation product first, then graded, then flood extent, and within one product type the version with the larger flooded fraction. A pipeline run does not rewrite it; Step 3 writes only the events new in that run to `3_dataset_metadata.csv` and appends them to the released catalog, so prior events and their assigned splits are preserved. Step 3 fills the continent, climate, aoi_area_km2, and flooded_area_km2 columns, and Step 5 fills the split column.
 
 The columns are below.
 

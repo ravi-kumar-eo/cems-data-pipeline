@@ -6,7 +6,7 @@ This file is the SINGLE SOURCE OF TRUTH for which GEE layers the pipeline
 exports. Every script reads the registry from here:
 
   - Script 2 (submit) exports one GeoTIFF per ENABLED layer.
-  - Script 4 (metadata) reports, per activation, which enabled layers arrived.
+  - Script 3 (metadata) reports, per activation, which enabled layers arrived.
 
 To add your own layer, copy one of the TEMPLATE blocks at the bottom, give it a
 unique `key` and `filename`, set the GEE `collection`, `bands`, `resolution_m`
@@ -36,7 +36,7 @@ from datetime import date, timedelta
 from typing import Callable, List, Optional
 
 # ee is imported lazily by the builders so that this module can be imported
-# (e.g. by config.py / Script 4) without an Earth Engine session.
+# (e.g. by config.py / Script 3) without an Earth Engine session.
 
 
 # ─── LAYER SPEC ───────────────────────────────────────────────────────────────

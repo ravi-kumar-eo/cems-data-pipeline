@@ -3,11 +3,9 @@
 Script 2: Submit GEE Export Tasks for Flood Activations
 
 For each activation in data/activations/ (output of Script 1), this script
-delivers the GEE layers. Two modes (config.EXPORT_MODE):
-  "direct" (default) — downloads each layer straight from GEE into
-      data/GEE_exports/{activation}/ (tiled getDownloadURL, no Drive, no
-      Script 3); continue directly with Script 4 preprocessing.
-  "drive" — submits Export.image.toDrive tasks; fetch results with Script 3.
+downloads the GEE layers straight onto disk into
+data/GEE_exports/{activation}/ with tiled getDownloadURL requests, then
+continue with Script 3 preprocessing.
 
 7 multi-band GeoTIFFs per activation (7 GEE tasks):
   S1_VV_VH.tif        2 bands   Sentinel-1 VV/VH median composite (30-90 days pre-event)
@@ -86,10 +84,8 @@ Modes:
   python 2_submit_gee_tasks.py                  SUBMIT: based on SUBMIT_TO_GEE config
   python 2_submit_gee_tasks.py --update-tracking  UPDATE: only update tracking CSV
 
-After GEE completes (typically hours):
-  1. Run Script 3 (3_download_gee_exports.py) to download from Google Drive
-  2. Downloaded files will be in: data/GEE_exports/{act_folder_name}/{layer}.tif
-  3. Run Script 4 to validate exports and produce flood_dataset.csv
+Downloads land in: data/GEE_exports/{EMSR_code}/{act_folder_name}/{layer}.tif
+Then run Script 3 to validate exports and produce the catalog.
 """
 
 # ─── CONFIG ──────────────────────────────────────────────────────────────────
@@ -126,25 +122,31 @@ PIXEL_DEG        = 0.0001           # ~10m at equator (S1, S2, ESA_PW)
 PRECIP_DEG        = 0.1             # GPM-IMERG V07 native resolution (~11.1 km)
 SMAP_DEG          = 0.09516         # SMAP SPL4SMGP native resolution (~9.5 km)
 
-REQUEST_DELAY    = 5                # seconds between GEE task submissions
 # ─────────────────────────────────────────────────────────────────────────────
 
 import argparse
 import csv
+import io
 import math
 import re
+import signal
 import sys
 import time
+import urllib.request
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import TimeoutError as FuturesTimeout
 from datetime import date, timedelta
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
+import numpy as np
+import rasterio
+from rasterio.transform import Affine
+
 import config
 from config import enabled_layers, enabled_keys
-import gee_direct
 
-# Direct-mode output dir: same place Script 3 would download to, so Script 4
-# preprocessing picks the files up unchanged whichever mode produced them.
+# Where the layers land, and where Script 3 preprocessing reads them from.
 # Alias of GEE_EXPORTS_DIR (set in PATH SETUP below) — one directory, so the
 # resume check and the downloader can never disagree.
 GEE_EXPORTS_LOCAL = config.GEE_EXPORTS_DIR
@@ -162,6 +164,204 @@ try:
 except ImportError:
     print("ERROR: geopandas not found in this environment.")
     sys.exit(1)
+
+
+# ─── DIRECT GEE DOWNLOAD ──────────────────────────────────────────────────────
+# Fetches an ee.Image straight to a local GeoTIFF with tiled getDownloadURL
+# requests. Tiles are square, sized per band count (see tile_size), fetched by
+# MAX_WORKERS threads with retries, then stitched and written atomically
+# (tmp file + rename) as an LZW-compressed GeoTIFF. Interactive getDownloadURL
+# requests are capped at ~50 MB each, hence the tiling.
+
+NODATA = -9999.0
+
+# Tile side in pixels. GEE caps an interactive getDownloadURL at 50 MB, and it
+# sizes the request as width*height*bands*8 (float64 internally, whatever the
+# band type), so the largest legal square depends on the BAND COUNT:
+#
+#     2 bands (S1, S2)  -> 1664 px  (44.3 MB)
+#     4 bands (MERIT)   -> 1152 px  (42.5 MB)
+#    30 bands (weather) ->  384 px  (35.4 MB)
+#
+# Bigger tiles are markedly cheaper per pixel — one 1664 px 2-band tile takes
+# ~17 s versus ~14.6 s for a 1024 px tile covering 2.6x less ground, i.e. 2.2x
+# faster per pixel — because each request carries a fixed GEE-side rendering
+# cost. TILE_MAX caps it so a single failed tile never wastes too much work.
+TILE_BYTES_LIMIT = 50 * 1024 * 1024
+TILE_SAFETY = 0.90          # stay clear of the hard limit
+TILE_MAX = 1664
+TILE_MIN = 256
+
+
+def tile_size(n_bands: int) -> int:
+    """Largest square tile (px) whose getDownloadURL request stays under the cap."""
+    budget = TILE_BYTES_LIMIT * TILE_SAFETY / max(1, n_bands) / 8
+    side = int(budget ** 0.5)
+    side -= side % 64                       # keep it a tidy multiple of 64
+    return max(TILE_MIN, min(TILE_MAX, side))
+
+
+# Wall-clock cap for the tiled-download phase (as_completed timeout).
+#
+# The budget SCALES WITH THE TILE COUNT: a fixed cap silently truncates large
+# AOIs, because the whole layer is abandoned when the clock runs out no matter
+# how many tiles were still in flight. A 26126x30534 px AOI is 780 tiles, which
+# cannot finish inside a flat 600 s at MAX_WORKERS=3 — that is how several
+# events ended up with S1/S2 (and therefore flood_mask) covering only a corner
+# of their AOI. Budget = SECONDS_PER_TILE per tile per worker, floored at
+# LAYER_DEADLINE_MIN so small layers still fail fast on a genuinely wedged tile.
+#
+# SECONDS_PER_TILE is the MEASURED SUSTAINED rate — wall-clock seconds per tile
+# for the whole layer, ALREADY NET OF PARALLELISM. Do not divide it by the
+# worker count: 24 tiles at 1664 px with 8 workers took 254 s = 10.6 s/tile
+# sustained, versus ~4 s/tile in a short burst, because GEE throttles sustained
+# concurrent rendering. Budgeting from the burst rate under-budgets ~4x and the
+# layer is abandoned half-finished. 16 s carries the slow tail over 10.6 s.
+LAYER_DEADLINE_MIN = 600
+SECONDS_PER_TILE = 16.0
+LAYER_DEADLINE_MAX = 21600          # 6 h — a real hang, not a big AOI
+# Extra head-room for the SIGALRM backstop covering the WHOLE download_image
+# call, including bandNames().getInfo() and any getDownloadURL that hangs BEFORE
+# the executor — those are outside the as_completed timeout and would otherwise
+# wedge the run forever. Larger than the layer deadline so the finer
+# as_completed timeout always wins first.
+HARD_DEADLINE_MARGIN = 90
+
+
+def layer_deadline(n_tiles: int) -> int:
+    """
+    Wall-clock budget for a tiled layer download, in seconds.
+
+    SECONDS_PER_TILE is a sustained, post-parallelism rate, so the estimate is
+    simply rate x tiles — no division by the worker count.
+    """
+    est = SECONDS_PER_TILE * n_tiles
+    return int(min(LAYER_DEADLINE_MAX, max(LAYER_DEADLINE_MIN, est)))
+
+
+# 8 parallel tile requests. Measured on a real AOI: 1 worker 19.6 s/tile,
+# 4 workers 5.3 s/tile, 8 workers 4.2 s/tile effective — GEE-side rendering
+# dominates, so concurrency scales well. 8 stays inside GEE's request limits.
+MAX_WORKERS = 8
+RETRIES = 5
+
+
+class _HardTimeout(Exception):
+    pass
+
+
+def _on_alarm(signum, frame):
+    raise _HardTimeout()
+
+
+def dims_from_bounds(minx: float, miny: float, maxx: float, maxy: float,
+                     pixel: float):
+    """Width/height in pixels of a snapped bbox on a pixel-deg grid."""
+    return (int(round((maxx - minx) / pixel)),
+            int(round((maxy - miny) / pixel)))
+
+
+def _fetch_tile(image, bands, tf: list, col0: int, row0: int, w: int, h: int):
+    """One tiled getDownloadURL request; returns (col0, row0, array)."""
+    tile_tf = [tf[0], tf[1], tf[2] + col0 * tf[0],
+               tf[3], tf[4], tf[5] + row0 * tf[4]]
+    # getDownloadURL() must be INSIDE the retry loop: it is itself a server call
+    # and returns 503 when GEE is busy. Retrying only urlopen() leaves that case
+    # unhandled, and one 503 then kills a layer that is 20 minutes in — the URL
+    # is also short-lived, so a stale one cannot be reused across a long backoff.
+    for attempt in range(RETRIES):
+        try:
+            url = image.select(bands).getDownloadURL({
+                "crs": "EPSG:4326", "crs_transform": tile_tf,
+                "dimensions": [w, h], "format": "GEO_TIFF"})
+            with urllib.request.urlopen(url, timeout=300) as r:
+                buf = r.read()
+            with rasterio.open(io.BytesIO(buf)) as src:
+                return col0, row0, src.read()
+        except Exception:
+            if attempt == RETRIES - 1:
+                raise
+            time.sleep(15 * (attempt + 1))
+
+
+def download_image(image, crs_transform: list, width: int, height: int,
+                   out_path: Path, band_names=None) -> bool:
+    """
+    Download `image` onto the (crs_transform, width, height) EPSG:4326 grid
+    and write it to out_path. Returns True on success, False on failure
+    (partial tmp files are removed; a failed layer can simply be retried).
+    """
+    out_path = Path(out_path)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = out_path.with_suffix(".tmp.tif")
+    ex = None
+    # Band count decides the legal tile size, so resolve it before tiling.
+    if band_names is None:
+        band_names = image.bandNames().getInfo()
+    tile = tile_size(len(band_names))
+    jobs = [(c, r, min(tile, width - c), min(tile, height - r))
+            for r in range(0, height, tile) for c in range(0, width, tile)]
+    deadline = layer_deadline(len(jobs))
+
+    # SIGALRM backstop — main-thread only, which is where the caller invokes this.
+    # Guarantees the call returns within the budget even if getInfo /
+    # getDownloadURL hang before the executor's own as_completed timeout applies.
+    have_alarm = hasattr(signal, "SIGALRM")
+    prev_handler = signal.signal(signal.SIGALRM, _on_alarm) if have_alarm else None
+    if have_alarm:
+        signal.alarm(deadline + HARD_DEADLINE_MARGIN)
+    try:
+        img = image.unmask(NODATA)  # only fills still-masked pixels
+        if len(jobs) > 200:
+            print(f"        ({len(jobs)} tiles @{tile}px, budget {deadline // 60} min)")
+        arr = np.full((len(band_names), height, width), NODATA, dtype=np.float32)
+        ex = ThreadPoolExecutor(max_workers=MAX_WORKERS)
+        futs = [ex.submit(_fetch_tile, img, band_names, crs_transform, *j)
+                for j in jobs]
+        try:
+            for fut in as_completed(futs, timeout=deadline):
+                col0, row0, data = fut.result()
+                arr[:, row0:row0 + data.shape[1],
+                    col0:col0 + data.shape[2]] = data
+            ex.shutdown(wait=True)
+        except FuturesTimeout:
+            # A tile is wedged (hung getDownloadURL / stalled socket). Abandon
+            # without waiting so the caller can move on; leaked threads unwind
+            # on their own once their urlopen timeout finally fires.
+            ex.shutdown(wait=False, cancel_futures=True)
+            print(f"        ✗ direct download timed out after {deadline}s "
+                  f"(layer abandoned)")
+            tmp.unlink(missing_ok=True)
+            return False
+        tf = Affine(*crs_transform[:2], crs_transform[2],
+                    *crs_transform[3:5], crs_transform[5])
+        prof = dict(driver="GTiff", dtype="float32", count=len(band_names),
+                    width=width, height=height, crs="EPSG:4326", transform=tf,
+                    nodata=NODATA, compress="lzw", tiled=True,
+                    bigtiff="if_safer")
+        with rasterio.open(tmp, "w", **prof) as dst:
+            dst.write(arr)
+            dst.descriptions = tuple(band_names)
+        tmp.rename(out_path)
+        return True
+    except _HardTimeout:
+        # A call hung before/around the executor (e.g. getInfo). Abandon so the
+        # caller moves on instead of the whole pipeline wedging on one activation.
+        if ex is not None:
+            ex.shutdown(wait=False, cancel_futures=True)
+        print(f"        ✗ direct download hard-timeout after "
+              f"{deadline + HARD_DEADLINE_MARGIN}s "
+              f"(pre-download hang, abandoned)")
+        tmp.unlink(missing_ok=True)
+        return False
+    except Exception as e:
+        print(f"        ✗ direct download failed: {e}")
+        tmp.unlink(missing_ok=True)
+        return False
+    finally:
+        if have_alarm:
+            signal.alarm(0)
+            signal.signal(signal.SIGALRM, prev_handler)
 
 try:
     import rasterio
@@ -331,63 +531,35 @@ def _gee_region(minx: float, miny: float, maxx: float, maxy: float):
                                   evenOdd=True)
 
 
-def _submit(image, description: str, file_prefix: str,
-            region, crs_transform: list, act_name: str, layer: str,
+def _submit(image, file_prefix: str, crs_transform: list,
+            act_name: str, layer: str,
             bounds4: tuple = None, pixel: float = None) -> bool:
     """
-    Deliver one layer, honouring config.EXPORT_MODE:
-      "direct"  download it now onto data/GEE_exports/{activation}/ with the
-                same grid the Drive export would have used (see gee_direct.py);
-      "drive"   submit an Export.image.toDrive task (fetch later via Script 3).
+    Download one layer onto data/GEE_exports/{EMSR_code}/{activation}/.
     bounds4/pixel are the snapped bbox and pixel size behind crs_transform;
-    direct mode needs them to size the output raster.
+    they size the output raster.
     Returns True on success.
     """
-    if config.EXPORT_MODE == "direct":
-        # nested {EMSR_code}/{activation}/ layout — what Script 4 iterates
-        out_dir = GEE_EXPORTS_LOCAL / act_name.split("_")[0] / act_name
-        out_path = out_dir / f"{file_prefix.split('/', 1)[1]}.tif"
-        # skip when the layer is already there — raw name from a previous direct
-        # run, or the canonical name Script 4 renames to (Drive-era folders)
-        canonical = {"S1": ["S1_VV_VH.tif"],
-                     "S2_indices": ["land_cover.tif", "S2_NDVI_NDBI.tif"],
-                     "ESA_PW": ["ESA_WorldCover_PermanentWater.tif"]}
-        existing = [out_path] + [out_dir / c for c in canonical.get(layer, [])]
-        hit = next((p for p in existing if p.exists()), None)
-        if hit is not None:
-            print(f"        ✓ exists, skip ({hit.name})")
-            return True
-        w, h = gee_direct.dims_from_bounds(*bounds4, pixel)
-        t0 = time.time()
-        ok = gee_direct.download_image(image, crs_transform, w, h, out_path)
-        if ok:
-            print(f"        ✓ downloaded {out_path.name} "
-                  f"({w}x{h}, {time.time()-t0:.0f}s)")
-        return ok
-
-    # GEE description must be ≤100 chars and unique-ish
-    short_desc = description[:100]
-    # Each activation gets its own folder in Google Drive
-    task = ee.batch.Export.image.toDrive(
-        image=image,
-        description=short_desc,
-        folder=act_name,  # Use activation folder name instead of single shared folder
-        fileNamePrefix=file_prefix,
-        crs="EPSG:4326",
-        crsTransform=crs_transform,
-        region=region,
-        maxPixels=int(1e13),
-        fileFormat="GeoTIFF",
-        formatOptions={"cloudOptimized": False},
-    )
-    try:
-        task.start()
-        task_id = task.id
-        print(f"        ✓ Submitted task {task_id}")
+    # nested {EMSR_code}/{activation}/ layout — what Script 3 iterates
+    out_dir = GEE_EXPORTS_LOCAL / act_name.split("_")[0] / act_name
+    out_path = out_dir / f"{file_prefix.split('/', 1)[1]}.tif"
+    # skip when the layer is already there — raw name from a previous run, or
+    # the canonical name Script 3 renames it to
+    canonical = {"S1": ["S1_VV_VH.tif"],
+                 "S2_indices": ["land_cover.tif", "S2_NDVI_NDBI.tif"],
+                 "ESA_PW": ["ESA_WorldCover_PermanentWater.tif"]}
+    existing = [out_path] + [out_dir / c for c in canonical.get(layer, [])]
+    hit = next((p for p in existing if p.exists()), None)
+    if hit is not None:
+        print(f"        ✓ exists, skip ({hit.name})")
         return True
-    except Exception as e:
-        print(f"        ✗ Submission failed: {e}")
-        return False
+    w, h = dims_from_bounds(*bounds4, pixel)
+    t0 = time.time()
+    ok = download_image(image, crs_transform, w, h, out_path)
+    if ok:
+        print(f"        ✓ downloaded {out_path.name} "
+              f"({w}x{h}, {time.time()-t0:.0f}s)")
+    return ok
 
 
 # ─── COVERAGE VALIDATION ─────────────────────────────────────────────────────
@@ -477,7 +649,7 @@ def find_layer_in_exports(folder_name: str, layer_name: str) -> Optional[Path]:
     """
     # Exports are written nested as {EMSR_code}/{folder_name}/ (see submit_layer),
     # so look there first. The flat {folder_name}/ layout is kept as a fallback
-    # for older Drive-era folders that were never re-nested.
+    # for older flat-layout folders that were never re-nested.
     candidates = [GEE_EXPORTS_DIR / folder_name.split("_")[0] / folder_name,
                   GEE_EXPORTS_DIR / folder_name]
     stem = Path(layer_name).stem
@@ -1074,15 +1246,9 @@ def submit_for_activation(act_folder: Path, download_tracker: DownloadTracker) -
 
     submitted = 0
 
-    # Helper: build Drive file prefix (creates subfolder in Drive)
+    # Helper: build the output path stem, {activation}/{layer}
     def prefix(layer: str) -> str:
         return f"{act_name}/{layer}"
-
-    def desc(layer: str) -> str:
-        import unicodedata, re as _re
-        safe = unicodedata.normalize("NFKD", act_name).encode("ascii", "ignore").decode("ascii")
-        safe = _re.sub(r"[^a-zA-Z0-9._,:;\-]", "_", safe)
-        return f"{safe[:70]}_{layer}"
 
     # Resolution (degrees) per layer key for the temporal layers' own grid.
     TEMPORAL_DEG = {"Precipitation": PRECIP_DEG, "SoilMoisture": SMAP_DEG}
@@ -1115,7 +1281,7 @@ def submit_for_activation(act_folder: Path, download_tracker: DownloadTracker) -
                 print(f"        ✗ Marked as NA (no images available)")
                 download_tracker.mark_layer_na(emsr_code, act_name, key)
                 continue
-            ok = _submit(img, desc(stem), prefix(stem), region, crs_tf, act_name, key,
+            ok = _submit(img, prefix(stem), crs_tf, act_name, key,
                          bounds4=(minx, miny, maxx, maxy), pixel=PIXEL_DEG)
             if ok and prov:
                 record_composite(act_name, key, spec.filename, event_date, prov)
@@ -1131,7 +1297,7 @@ def submit_for_activation(act_folder: Path, download_tracker: DownloadTracker) -
             first_day = (event_date - timedelta(days=spec.n_days)).strftime("%Y%m%d")
             last_day  = (event_date - timedelta(days=1)).strftime("%Y%m%d")
             dated = f"{spec.filename[:-4]}_{first_day}_{last_day}"
-            ok = _submit(img, desc(dated), prefix(dated), t_region, t_tf, act_name, key,
+            ok = _submit(img, prefix(dated), t_tf, act_name, key,
                          bounds4=(t_minx, t_miny, t_maxx, t_maxy), pixel=deg)
 
         else:  # static
@@ -1140,16 +1306,15 @@ def submit_for_activation(act_folder: Path, download_tracker: DownloadTracker) -
             # same AOI footprint. ESA_PW (10 m) lands on the fine reference grid;
             # MERIT (90 m) and SoilGrids (250 m) keep their coarse native pixels.
             if abs(spec.resolution_m - 10.0) < 1e-6:
-                ok = _submit(img, desc(stem), prefix(stem), region, crs_tf, act_name, key,
+                ok = _submit(img, prefix(stem), crs_tf, act_name, key,
                              bounds4=(minx, miny, maxx, maxy), pixel=PIXEL_DEG)
             else:
                 deg = spec.resolution_m / 111000.0
                 s_minx, s_miny, s_maxx, s_maxy, s_tf = _snap_bounds(*bounds, deg)
-                s_region = _gee_region(s_minx, s_miny, s_maxx, s_maxy)
-                ok = _submit(img, desc(stem), prefix(stem), s_region, s_tf, act_name, key,
+                ok = _submit(img, prefix(stem), s_tf, act_name, key,
                              bounds4=(s_minx, s_miny, s_maxx, s_maxy), pixel=deg)
 
-        if ok and config.EXPORT_MODE == "direct":
+        if ok:
             # file is already on disk and validated grid-wise; record it so
             # needs_submission() skips it on the next run
             rec = download_tracker.get(act_name) or {
@@ -1159,8 +1324,6 @@ def submit_for_activation(act_folder: Path, download_tracker: DownloadTracker) -
             download_tracker.upsert(rec)
 
         submitted += int(ok)
-        if config.EXPORT_MODE != "direct":
-            time.sleep(REQUEST_DELAY)
 
     return submitted
 
@@ -1296,15 +1459,8 @@ def main():
         print("  Note: Activations with 'NA' status in any layer are skipped")
         print("        (NA = no GEE images available for that layer)")
         print()
-        if config.EXPORT_MODE == "direct":
-            print("  Layers were downloaded directly to data/GEE_exports/.")
-            print("  Next: run Script 4 to validate/preprocess, then Script 5 → patches")
-        else:
-            print("  Next steps after GEE tasks complete:")
-            print(f"    1. Download activation folders from Google Drive (Script 3)")
-            print(f"       Each activation has its own folder (e.g., EMSR123_AOI01_...)")
-            print(f"       Inside each folder: S1_VV_VH.tif, land_cover.tif, MERIT.tif, etc.")
-            print(f"    2. Run Script 4 to validate exports, then Script 5 to process downloads → patches")
+        print("  Layers were downloaded directly to data/GEE_exports/.")
+        print("  Next: run Script 3 to validate/preprocess, then Script 4 → patches")
         print("=" * 72)
 
     # ── Update Download Tracking CSV ──────────────────────────────────────

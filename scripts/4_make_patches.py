@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """
-Script 5: Make patches
+Script 4: Make patches
 
 Cuts each cataloged event's co-registered GeoTIFFs into square patches
 (STRIDE_M controls the overlap between neighbours; STRIDE_M = PATCH_SIZE_M
 means none) and writes them as individual GeoTIFFs, then validates every patch.
-The train/val/test split is assigned afterwards in Step 6, which balances by
+The train/val/test split is assigned afterwards in Step 5, which balances by
 patch count and so needs the patches to exist first.
 
 A patch covers PATCH_SIZE_M x PATCH_SIZE_M on the ground (2.56 km by default)
@@ -17,7 +17,7 @@ and is written at four resolutions plus the label, five files in all:
   patch_NNNN_input_2560m.tif    1x1  , 2N bands  Precipitation (N) + SoilMoisture (N), N=30 default
   patch_NNNN_flood_mask.tif   256x256, 1 band    CEMS flood extent (1 = flooded)
 
-The flood mask is the CEMS delineation only (flood_mask.tif from Step 4). It is
+The flood mask is the CEMS delineation only (flood_mask.tif from Step 3). It is
 never altered with permanent water. Permanent water is provided as a separate
 input band (band 5 of input_10m), so a model can distinguish pre-existing water
 from new flooding but the label stays the raw observed inundation.
@@ -33,11 +33,11 @@ Input
 
 Output
   data/patches/{EMSR}/{folder}/patch_NNNN_*.tif
-  data/metadata/released_patches_metadata.csv    one row per patch (split added in Step 6)
+  data/metadata/released_patches_metadata.csv    one row per patch (split added in Step 5)
   data/metadata/5_patch_validation_issues.csv    QC findings, if any
 
 Usage
-  python scripts/5_make_patches.py
+  python scripts/4_make_patches.py
 """
 
 import csv
@@ -91,7 +91,7 @@ PX_80M   = int(PATCH_SIZE_M / RES_80M)     # 32
 PX_160M  = int(PATCH_SIZE_M / RES_160M)    # 16
 PX_2560M = int(PATCH_SIZE_M / RES_2560M)   # 1
 
-# Canonical per-event layer filenames (post Step 4 rename).
+# Canonical per-event layer filenames (post Step 3 rename).
 F_S1    = "S1_VV_VH.tif"
 F_S2    = "S2_NDVI_NDBI.tif"
 F_MERIT = "MERIT.tif"
@@ -246,7 +246,7 @@ def build_stack_2560m(gee: Path, ref_bounds, ref_crs):
 def build_flood_mask(gee: Path, ref_bounds, ref_crs):
     """
     Flood mask at 10 m, CEMS delineation only. Prefer the event's flood_mask.tif
-    (produced by Step 4); fall back to rasterising flood_extent/event.shp.
+    (produced by Step 3); fall back to rasterising flood_extent/event.shp.
     Never merges permanent water.
     """
     w, h, transform = _grid(ref_bounds, RES_10M)
@@ -408,7 +408,7 @@ def _append_csv(path: Path, fields: List[str], rows: List[Dict]) -> None:
 
 def main():
     print("=" * 80)
-    print("  Script 5: Make patches")
+    print("  Script 4: Make patches")
     print(f"  Patch size : {PATCH_SIZE_M} m  ({PX_10M}x{PX_10M} @ 10 m), stride {STRIDE_M} m")
     print(f"  Output     : {PATCHES_DIR}")
     print("=" * 80)

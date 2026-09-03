@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Script 4: GEE Output Preprocessing — metadata builder
+Script 3: GEE Output Preprocessing — metadata builder
 
 This step builds the dataset catalog. An event missing a CORE layer is
 incomplete and is left out of the catalog; it is recorded in the missing-layers
@@ -39,7 +39,7 @@ Output files:
   metadata/4_missing_layers_report.csv       per event, which enabled layers are absent
 
 Usage:
-  python scripts/4_gee_output_preprocessing.py
+  python scripts/3_gee_output_preprocessing.py
 """
 
 import csv
@@ -122,7 +122,7 @@ KOPPEN_LABEL = {"A": "A Tropical", "B": "B Arid", "C": "C Temperate",
 
 # Layer file → expected band count, derived from the ENABLED registry. Used only
 # to REPORT missing layers, never to drop an activation. flood_mask is added
-# because Script 4 produces it locally (it is not a GEE export).
+# because Script 3 produces it locally (it is not a GEE export).
 def _expected_layers():
     layers = {spec.key: {"file": spec.filename, "bands": spec.band_count()}
               for spec in enabled_layers()}
@@ -154,9 +154,9 @@ def reorganize_export(export_root: Path) -> bool:
         SoilMoisture.tif   10 bands
 
     Three things are handled:
-      1. Flatten nested subfolder — GEE toDrive() with a slash in fileNamePrefix
-         creates a subfolder inside the Drive folder; script 3 preserves that,
-         so files land at export_root/{folder_name}/ instead of export_root/.
+      1. Flatten nested subfolder — older exports written with a slash in the
+         file prefix landed at export_root/{folder_name}/ rather than
+         export_root/, so that nesting is flattened here.
       2. Merge spatial tiles — when an export exceeds GEE's per-file limit it is
          split into tiles named {Layer}-XXXXXXXXXX-XXXXXXXXXX.tif.  Any number of
          tiles is supported; they are mosaicked and the originals deleted.
@@ -213,12 +213,12 @@ def reorganize_export(export_root: Path) -> bool:
         # Validate tiles (skip 0-byte/corrupt files — they were incomplete downloads)
         valid_tiles = [t for t in tiles if t.stat().st_size > 0]
         if not valid_tiles:
-            print(f"    ! all tiles for {prefix} are 0-byte — re-run script 3 to re-download")
+            print(f"    ! all tiles for {prefix} are 0-byte — re-run script 2 to re-download")
             continue
         if len(valid_tiles) < len(tiles):
             bad = [t.name for t in tiles if t.stat().st_size == 0]
             print(f"    ! skipping corrupt (0-byte) tiles for {prefix}: {bad}")
-            print(f"      Delete them and re-run script 3, then script 4 again")
+            print(f"      Delete them and re-run script 2, then script 3 again")
             continue
 
         try:
@@ -715,7 +715,7 @@ def find_activation_in_exports(folder_name: str) -> Optional[Path]:
 
 def main():
     print("=" * 72)
-    print("  GEE Output Preprocessing  (Script 4)")
+    print("  GEE Output Preprocessing  (Script 3)")
     print(f"  BASE_DIR        : {BASE_DIR}")
     print(f"  GEE_EXPORTS_DIR : {GEE_EXPORTS_DIR}")
     print(f"  GEE_TASKS_CSV   : {GEE_TASKS_CSV}")
@@ -730,7 +730,7 @@ def main():
 
     if not GEE_EXPORTS_DIR.exists():
         print(f"\n! GEE_EXPORTS_DIR not found: {GEE_EXPORTS_DIR}")
-        print("  Run Script 3 first to download GEE exports.")
+        print("  Run Script 2 first to download GEE exports.")
         sys.exit(1)
 
     META_DIR.mkdir(parents=True, exist_ok=True)

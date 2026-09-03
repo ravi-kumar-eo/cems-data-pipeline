@@ -9,7 +9,7 @@ This is the ONE file you edit to control what the pipeline produces:
 
 The layer definitions themselves live in add_gee_layers.py. config.py applies
 your toggles / overrides to that registry and exposes `enabled_layers()`, which
-Scripts 2 and 4 iterate over. Disabling a layer here means it is never exported
+Scripts 2 and 3 iterate over. Disabling a layer here means it is never exported
 and never reported as "missing" — the pipeline produces a clean, smaller dataset
 with no failures.
 
@@ -60,19 +60,8 @@ N_DAYS_OVERRIDE: Dict[str, int] = {
 
 TEMPORAL_BUFFER_DEG: float = 0.6
 
-# How Script 2 delivers the layers:
-#   "direct"  download straight from GEE onto disk (tiled getDownloadURL into
-#             data/GEE_exports/). No Drive account needed, no Script 3 — go
-#             straight to Script 4 preprocessing. Runs synchronously, so a big
-#             batch keeps the machine busy while it downloads.
-#   "drive"   the original path: submit Export.image.toDrive tasks, then fetch
-#             the results with Script 3. Better for very large batches because
-#             GEE renders exports server-side while nothing runs locally.
-EXPORT_MODE: str = "direct"
-
-
-# ─── 4. PATCH TILING (Step 6) ─────────────────────────────────────────────────
-# Step 6 cuts each event's co-registered layers into square, non-overlapping
+# ─── 4. PATCH TILING (Step 4) ─────────────────────────────────────────────────
+# Step 4 cuts each event's co-registered layers into square, non-overlapping
 # patches. PATCH_SIZE_M is the ground side of a patch; STRIDE_M is the step
 # between patch origins (= PATCH_SIZE_M means no overlap). MIN_VALID_RATIO drops
 # a patch whose 10 m stack is mostly nodata. The per-resolution pixel grids
@@ -98,11 +87,6 @@ HYDROBASINS_DIR     = DATA_DIR / "hydrobasins"
 CONTINENTS_DIR      = DATA_DIR / "continents"   # Natural Earth countries (continent field)
 CLIMATE_DIR         = DATA_DIR / "climate"      # Beck Koppen-Geiger raster
 
-# Step 3 (drive mode only) — Google Drive OAuth
-GDRIVE_TOKEN_FILE   = DATA_DIR / ".gdrive_token.json"
-GDRIVE_CREDS_DIR    = BASE_DIR / "Gdrive_credentials"
-
-
 # ─── STEP-NUMBERED METADATA FILES ─────────────────────────────────────────────
 # Prefix = the pipeline step that writes the file.
 
@@ -119,17 +103,17 @@ CSV_GEE_EXPORT_STATUS   = META_DIR / "2_gee_export_status.csv"   # per-layer exp
 # back to its source imagery.
 CSV_COMPOSITE_REGISTRY  = META_DIR / "2_composite_registry.csv"
 
-# Step 4 — metadata compilation
-CSV_DATASET_METADATA    = META_DIR / "4_dataset_metadata.csv"    # events new in the latest run
+# Step 3 — metadata compilation
+CSV_DATASET_METADATA    = META_DIR / "3_dataset_metadata.csv"    # events new in the latest run
 CSV_COMPLETE_METADATA   = META_DIR / "released_events_metadata.csv"  # full accumulated catalog (one row per event)
-CSV_MISSING_LAYERS      = META_DIR / "4_missing_layers_report.csv"  # missing enabled layers/event
+CSV_MISSING_LAYERS      = META_DIR / "3_missing_layers_report.csv"  # missing enabled layers/event
 
-# Step 5 — patch tiling
+# Step 4 — patch tiling
 PATCHES_DIR             = DATA_DIR / "patches"                       # patch tiles
 CSV_PATCH_METADATA      = META_DIR / "released_patches_metadata.csv"  # one row per patch
-CSV_PATCH_VALIDATION    = META_DIR / "5_patch_validation_issues.csv"  # QC findings
+CSV_PATCH_VALIDATION    = META_DIR / "4_patch_validation_issues.csv"  # QC findings
 
-# Step 6 — split generation (runs after patching, balances by patch count)
+# Step 5 — split generation (runs after patching, balances by patch count)
 SPLIT_DIR               = META_DIR / "split_global"                  # the three split index files
 CSV_TRAIN_PATCHES       = SPLIT_DIR / "train_patches.csv"
 CSV_VAL_PATCHES         = SPLIT_DIR / "val_patches.csv"
@@ -193,7 +177,6 @@ def _rebase_derived_paths() -> None:
         "HYDROBASINS_DIR":     base / "hydrobasins",
         "CONTINENTS_DIR":      base / "continents",
         "CLIMATE_DIR":         base / "climate",
-        "GDRIVE_TOKEN_FILE":   base / ".gdrive_token.json",
         "PATCHES_DIR":         base / "patches",
         "PLOTS_DIR":           base / "plots" / "splits",
         "SPLIT_DIR":           meta / "split_global",
@@ -202,11 +185,11 @@ def _rebase_derived_paths() -> None:
         "CSV_ACTIVATION_CATALOG": meta / "1_activation_catalog.csv",
         "CSV_GEE_EXPORT_STATUS":  meta / "2_gee_export_status.csv",
         "CSV_COMPOSITE_REGISTRY": meta / "2_composite_registry.csv",
-        "CSV_DATASET_METADATA":   meta / "4_dataset_metadata.csv",
+        "CSV_DATASET_METADATA":   meta / "3_dataset_metadata.csv",
         "CSV_COMPLETE_METADATA":  meta / "released_events_metadata.csv",
-        "CSV_MISSING_LAYERS":     meta / "4_missing_layers_report.csv",
+        "CSV_MISSING_LAYERS":     meta / "3_missing_layers_report.csv",
         "CSV_PATCH_METADATA":     meta / "released_patches_metadata.csv",
-        "CSV_PATCH_VALIDATION":   meta / "5_patch_validation_issues.csv",
+        "CSV_PATCH_VALIDATION":   meta / "4_patch_validation_issues.csv",
     }
     for name, value in derived.items():
         # Only rebase what config_local did not set itself.
@@ -233,6 +216,11 @@ CSV_MIGRATION = {
     "dataset_metadata.csv":     CSV_DATASET_METADATA.name,
     "complete_dataset_metadata.csv": CSV_COMPLETE_METADATA.name,
     "patch_metadata.csv":       CSV_PATCH_METADATA.name,
+    # Step renumbering after the Drive export path was removed: the old Step 4
+    # (preprocessing) is now Step 3, Step 5 (patching) is now Step 4.
+    "4_dataset_metadata.csv":       CSV_DATASET_METADATA.name,
+    "4_missing_layers_report.csv":  CSV_MISSING_LAYERS.name,
+    "5_patch_validation_issues.csv": CSV_PATCH_VALIDATION.name,
 }
 
 
@@ -269,7 +257,7 @@ def enabled_layers() -> List[LayerSpec]:
     """
     The layers the pipeline should produce this run: registry order, custom
     layers appended, filtered by LAYER_TOGGLES, with n_days overrides applied.
-    Scripts 2 and 4 both iterate this list — the single source of truth for a run.
+    Scripts 2 and 3 both iterate this list — the single source of truth for a run.
     """
     out = []
     for spec in add_gee_layers.all_layers():

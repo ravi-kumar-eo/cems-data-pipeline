@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
 """
-Script 6: Make train/val/test split
+Script 5: Make train/val/test split
 
 Assigns every patch to a train, validation, or test split and writes the
 assignment into the `split` column of both the patch index and the event
 catalog, plus three split index files (train/val/test_patches.csv) and a set of
 balance plots.
 
-The split runs after patch extraction (Step 5) because it balances by PATCH
+The split runs after patch extraction (Step 4) because it balances by PATCH
 count: the weight of each event is how many patches it yields, which is only
 known once the patches exist.
 
@@ -31,7 +31,7 @@ climate-homogeneous components dominate the patch count and cannot be divided, s
 the climate mix is fixed by how those components fall.
 
 Input
-  data/metadata/released_patches_metadata.csv   one row per patch (from Step 5)
+  data/metadata/released_patches_metadata.csv   one row per patch (from Step 4)
   data/metadata/released_events_metadata.csv     one row per event (aoi_area_km2)
 
 Output
@@ -41,7 +41,7 @@ Output
   data/plots/splits/*.png                         balance plots (if matplotlib present)
 
 Usage
-  python scripts/6_make_splits.py
+  python scripts/5_make_splits.py
 """
 
 import sys
@@ -126,7 +126,7 @@ def build_components(df):
 # ── ASSIGNMENT ───────────────────────────────────────────────────────────────
 def assign_splits(df, ev):
     # Continent drives the soft per-continent balancing. If the catalog has no
-    # continent column (an older Step 4), fall back to one global bucket: the
+    # continent column (an older Step 3), fall back to one global bucket: the
     # hard basin/event constraints still hold and a valid split is still made.
     if "continent" not in df.columns or df["continent"].isna().all():
         df = df.copy()
@@ -314,12 +314,12 @@ def make_plots(df, ev):
 # ── MAIN ──────────────────────────────────────────────────────────────────────
 def main():
     print("=" * 70)
-    print("  Script 6: Make train/val/test split")
+    print("  Script 5: Make train/val/test split")
     print("=" * 70)
 
     if not PATCH_CSV.exists():
         print(f"ERROR: patch index not found: {PATCH_CSV}\n"
-              f"Run Step 5 (5_make_patches.py) first.")
+              f"Run Step 4 (4_make_patches.py) first.")
         sys.exit(1)
 
     df = pd.read_csv(PATCH_CSV)
